@@ -76,3 +76,19 @@ The shared source incorporates the Direct run's dual-mode integration and the
 Gain path's exact-geometry blockwise backend. The two-body RK4 batch implementation
 is shared by the portable model; the serial adapter uses it for a single track.
 No KalmanNet network or experiment infrastructure is needed at runtime.
+
+## Model Plan V1 & Model Plan V2 Extensions
+
+Building directly on the frozen `Prepared` data loader and differentiable `float64` two-body RK4 physics, this repository also implements **Model Plan V1** and **Model Plan V2**:
+
+- **Shared Physics, STM & Stratified Evaluation**:
+  - `v6/models/reprojection.py`: analytical RK4 tangent-linear STM $\Phi(t_j, t_k)$, branchless $\mathrm{SO}(3)$ LOS tangent frames, spherical retraction $\mathrm{Exp}_{S^2}$, local Log-MSC chart $B_k$, sign-verified sensitivity $A = -D_y\nu(0)$, and `pois10`-compatible unequal-time triplet noise-floor calibration $\tau_k$.
+  - `v6/data/splits.py` & `v6/eval_metrics.py`: `source_id`-isolated `train_fit / train_calib / dev_select` splits, macro-checkpoint & `Block 2 + 30 s` scheduling, 4-cadence + `source_id`-equal tables, fair prior-referenced good-orbit harm rates, and cluster-paired bootstrap 95% CIs.
+- **Model Plan V1 (`v6/models/v1_ltr_lm.py`, `v6/models/v1_fd_asf.py`, `v6/training_v1.py`)**:
+  - Classical non-learned controls (`cl_gn1_pure`, `cl_gn1_matched`, `cl_window_lm`, `cl_full_prefix_wls`), Jacobian-free bounded refiners (`JF-BR-Vel`, `JF-BR-6D`), and learned trust-region preconditioned 1-step LM (`LTR-LM` with `joint_6d`, `schur_vel`, `lock_pos_vel`).
+  - Flagship `FD-ASF`: batch-invariant continuous-time Legendre tracklet encoder $(H_s, B_s)$, $2+4$ Lambert ($M=0$) & Attributable ambiguity charts with exact log-Jacobian volume, 4-layer Conditional RealNVP proposal trained on SNIS optimal forecast disagreement $q_k^\star \propto \pi_k\|\mathbf{h}_{k+1}-\bar{\mathbf{h}}_{k+1}\|_2$ with defensive mixing, incremental block likelihood SMC, and 3-condition dominance-gated publishing.
+  - Entry points: `scripts/train_v1.py`, `scripts/validate_v1.py`.
+- **Model Plan V2 (`v6/models/v2_asd_sc.py`, `v6/training_v2.py`)**:
+  - `ASD-SC`: progressive subspace bounded blind denoiser ($L=2$ microsteps, 0.5/0.9 directional log-error quantile head, deadzone $\chi_i$, bounded shrinkage $g_i \in [g_{\min}, 1]$), cross-gap thin-QR pending subspace transport $D^{-1}\Phi D V_p = QR$, $K_p$ conditional unlock & $E_a$ restricted writeback ($E_h^\top\Delta\mathbf{y}=0$), A/B/C causal re-anchoring, DAgger rollout buffer, 2-checkpoint cross-gap unrolling, $\{0, 60, 300\}\text{ s}$ multi-horizon risk, and switchable progressive step-increment supervision $T_\ell\mathbf{d}_\ell$.
+  - Entry points: `scripts/train_v2.py`, `scripts/validate_v2.py`.
+
