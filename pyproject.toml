@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v6-orbit-filter"
+version = "0.1.0"
+description = "V6 scalar-vector orbit filter with Gain and DirectCorrection modes"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24,<3", "torch==2.8.0"]
+
+[tool.setuptools.packages.find]
+include = ["v6*"]
