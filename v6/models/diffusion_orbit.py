@@ -1,34 +1,4 @@
-"""Round 5 Converged Genuine Diffusion Architecture (3+1 Core Knobs: K, P, delta, optional B_los).
-
-Implements both mathematically verified diffusion routes from
-docs/ROUND5_MINIMAL_DIFFUSION_DESIGN.md and
-outputs/research_codex/ROUND5_DIFFUSION_AND_HYPERPARAM_REVIEW.md (acabb03):
-
-1. Route A (Primary): VPOrbitDiffusionFilter (Cosine-VP Conditional Orbital Diffusion)
-   - Forward whitened cosine VP path (s in [0, pi/2], alpha = cos s, sigma = sin s):
-         x* = x^- + D (e_bar_b + L_b z_0),   z_s = alpha z_0 + sigma eps
-         v* = alpha eps - sigma z_0,         (v_theta, V_theta) = f_theta(z_s, s, c^-)
-         m_s = alpha z_s - sigma v_theta,    C_s = sigma^2 V_theta,  V_theta = delta I + B B^T
-     trained with a SINGLE multi-scale velocity + second-moment Gaussian NLL objective.
-   - Fresh-batch-only noisy-time likelihood guidance with exact denoiser Jacobian VJP:
-         g_s^loc(z) = (D_z m_s)^T H^T (R + H C_s H^T)^{-1} (Y - h(m_s))
-     solved in O(6^3) via Cholesky factor of C_s without inverting 2N x 2N matrices.
-   - Explicit K-interval interior-midpoint reverse Probability Flow ODE:
-         dz / ds = v_theta(z, s, c^-) - tan(s) g_s^loc(z),   s: pi/2 -> 0
-     returning full diffusion trajectories for direct interpretability.
-   - Strict separation of artificial noise sigma^2 I, conditional moment C_s, physical
-     uncertainty P_m^+/-, and measurement noise R; cross-gap transport of all P independent
-     two-body trajectories regularized by the SAME single delta:
-         P_carry^+ = (1 - delta) P_samples^+ + delta P_b^+.
-
-2. Route B (Separate Multi-Modal Proposal / Weighted Chain):
-   - RouteBGuidedCosineFlow2D (B1 Deterministic Guided Cosine Flow on R^2):
-     shared cosine path + guided field v_g = v_psi + omega cot(omega t) g_t, with EXACT
-     discrete K-step map log-Jacobian sum_j log|det D T_j| (zero continuous/discrete mismatch).
-   - RouteBTwistedDiffusionSMC (B2 Stochastic Twisted Diffusion SMC, Wu et al. NeurIPS 2023):
-     explicit stochastic reverse transition p_j, guided proposal q_j, and telescoping potentials
-     psi_0 = ell(Y | F_b), psi_K = 1 yielding exact incremental weights G_{j-1}.
-"""
+"""Per-arrival orbit filtering with angular and state-space cosine VP diffusion."""
 
 from __future__ import annotations
 
@@ -36,20 +6,18 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..data.observation_clock import causal_diffusion_events
+from ..data.observation_clock import observation_frames
 from .batched_physics import DTYPE, state_scale
 from .normalization import EARTH_RADIUS_M, T_SCALE_S, V_SCALE_MPS
 from .recursive_filter import TrainingFilterOutput
 from .reprojection import (
     ComputeLedger,
     build_los_frame,
-    estimate_online_los_noise_floor,
+    RunningLOSNoise,
     propagate_si_with_stm,
-    reproject_causal_window_single,
 )
 from .v1_fd_asf import ContinuousTrackletEncoder
 
@@ -61,16 +29,20 @@ def safe_cholesky_spd(mat: Tensor, *, jitter: float = 1.0e-12) -> Tensor:
     """Symmetrize and compute Cholesky factor L such that mat ~= L L^T."""
     sym = 0.5 * (mat + mat.transpose(-1, -2))
     eye = torch.eye(sym.shape[-1], device=sym.device, dtype=sym.dtype)
-    eps = float(jitter)
-    for _ in range(6):
-        try:
-            return torch.linalg.cholesky(sym + eps * eye)
-        except RuntimeError:
-            eps *= 10.0
-    eigvals, eigvecs = torch.linalg.eigh(sym)
-    eigvals = eigvals.clamp_min(1.0e-10)
-    rebuilt = (eigvecs * eigvals.unsqueeze(-2)) @ eigvecs.transpose(-1, -2)
-    return torch.linalg.cholesky(0.5 * (rebuilt + rebuilt.transpose(-1, -2)) + 1.0e-10 * eye)
+    factor, info = torch.linalg.cholesky_ex(sym + jitter * eye)
+    if bool((info == 0).all()):
+        return factor
+    # A rank-deficient particle cloud can have a scale much larger than an
+    # absolute jitter. Repair only failed members at their own numerical scale.
+    flat = sym.reshape(-1, sym.shape[-1], sym.shape[-1])
+    failed = info.reshape(-1) != 0
+    value, basis = torch.linalg.eigh(flat[failed])
+    floor = (32 * torch.finfo(sym.dtype).eps * value.abs().amax(-1, keepdim=True)).clamp_min(jitter)
+    clean = (basis * value.clamp_min(floor).unsqueeze(-2)) @ basis.transpose(-1, -2)
+    fixed = torch.linalg.cholesky((clean + clean.transpose(-1, -2)) / 2 + floor.unsqueeze(-1) * eye)
+    out = factor.reshape_as(flat).clone()
+    out[failed] = fixed
+    return out.reshape_as(sym)
 
 
 def build_diagonal_los_prior_covariance(
@@ -212,6 +184,7 @@ class CosineVPDenoiserNet(nn.Module):
         context_dim: int = 64,
         hidden_dim: int = 96,
         time_dim: int = 16,
+        state_dim: int = 6,
         delta: float = 0.10,
         fixed_isotropic_v: bool = False,
         dtype: torch.dtype = DTYPE,
@@ -225,7 +198,8 @@ class CosineVPDenoiserNet(nn.Module):
         self.fixed_isotropic_v = bool(fixed_isotropic_v)
 
         self.time_emb = SinusoidalTimeEmbedding(time_dim, dtype=dtype)
-        in_dim = 6 + time_dim + context_dim
+        self.state_dim = int(state_dim)
+        in_dim = self.state_dim + time_dim + context_dim
         self.backbone = nn.Sequential(
             nn.Linear(in_dim, hidden_dim, dtype=dtype),
             nn.SiLU(),
@@ -234,14 +208,12 @@ class CosineVPDenoiserNet(nn.Module):
             nn.Linear(hidden_dim, hidden_dim, dtype=dtype),
             nn.SiLU(),
         )
-        self.v_head = nn.Linear(hidden_dim, 6, dtype=dtype)
-        # Predict 6x6 factor B_theta with V_theta = delta I + B_theta B_theta^T
-        # Initialize B_theta = sqrt(1 - delta) I_6 so initial V_theta == I_6!
-        self.b_head = nn.Linear(hidden_dim, 36, dtype=dtype)
+        self.v_head = nn.Linear(hidden_dim, self.state_dim, dtype=dtype)
+        self.b_head = nn.Linear(hidden_dim, self.state_dim**2, dtype=dtype)
         nn.init.normal_(self.v_head.weight, mean=0.0, std=1.0e-3)
         nn.init.zeros_(self.v_head.bias)
         nn.init.normal_(self.b_head.weight, mean=0.0, std=1.0e-3)
-        init_b = math.sqrt(max(1.0 - self.delta, 0.0)) * torch.eye(6, dtype=dtype).reshape(36)
+        init_b = math.sqrt(max(1.0 - self.delta, 0.0)) * torch.eye(self.state_dim, dtype=dtype).flatten()
         with torch.no_grad():
             self.b_head.bias.copy_(init_b)
 
@@ -267,12 +239,12 @@ class CosineVPDenoiserNet(nn.Module):
         h = self.backbone(torch.cat((zb_p, t_feat, ctx), dim=-1))
         v_theta = self.v_head(h)
 
-        eye6 = torch.eye(6, device=device, dtype=p_dtype).unsqueeze(0).expand(batch, 6, 6)
+        eye = torch.eye(self.state_dim, device=device, dtype=p_dtype).expand(batch, -1, -1)
         if self.fixed_isotropic_v:
-            V_theta = eye6
+            V_theta = eye
         else:
-            B_mat = self.b_head(h).reshape(batch, 6, 6)
-            V_theta = self.delta * eye6 + torch.bmm(B_mat, B_mat.transpose(-1, -2))
+            B_mat = self.b_head(h).reshape(batch, self.state_dim, self.state_dim)
+            V_theta = self.delta * eye + torch.bmm(B_mat, B_mat.transpose(-1, -2))
 
         alpha = torch.cos(s_t).unsqueeze(-1)
         sigma = torch.sin(s_t).unsqueeze(-1)
@@ -292,6 +264,65 @@ class CosineVPDenoiserNet(nn.Module):
             m_s.to(z_s.dtype),
             C_s.to(z_s.dtype),
         )
+
+
+class AngularNoiseDiffusion(nn.Module):
+    """Conditional VP diffusion of standardized two-dimensional sensor residuals."""
+
+    def __init__(self, dtype=DTYPE):
+        super().__init__()
+        self.net = CosineVPDenoiserNet(state_dim=2, context_dim=14, hidden_dim=48, dtype=dtype)
+
+    @staticmethod
+    def context(ray, station, previous_innovation, dt, sigma):
+        return torch.cat(
+            (
+                ray,
+                station[:3] / EARTH_RADIUS_M,
+                station[3:] / V_SCALE_MPS,
+                torch.asinh(previous_innovation / sigma),
+                ray.new_tensor([math.log1p(dt / T_SCALE_S), math.log(sigma)]),
+            )
+        )
+
+    def moments(self, context, steps, particles, generator):
+        """Run the cosine VP ancestral chain and average the final conditional moments."""
+        z = torch.randn((particles, 2), dtype=context.dtype, device=context.device, generator=generator)
+        eye = torch.eye(2, dtype=z.dtype, device=z.device)
+        for i in range(steps, 0, -1):
+            s = HALF_PI * i / steps
+            a = 0.0 if i == steps else math.cos(s)
+            prev = math.cos(HALF_PI * (i - 1) / steps)
+            ratio = a / prev
+            beta = 1.0 - ratio**2
+            _, _, clean, clean_cov = self.net(z, s, context)
+            coeff = prev * beta / (1.0 - a * a)
+            mean = coeff * clean + (ratio * (1.0 - prev * prev) / (1.0 - a * a)) * z
+            covariance = coeff**2 * clean_cov + (beta * (1.0 - prev * prev) / (1.0 - a * a)) * eye
+            if i == 1:
+                average = mean.mean(0)
+                centered = mean - average
+                return average, covariance.mean(0) + centered.T @ centered / particles
+            eps = torch.randn(z.shape, dtype=z.dtype, device=z.device, generator=generator)
+            z = mean + (safe_cholesky_spd(covariance) @ eps.unsqueeze(-1)).squeeze(-1)
+        raise ValueError("The reverse chain needs at least one step")
+
+    def loss(self, clean, context):
+        s = torch.rand(clean.shape[0], device=clean.device, dtype=clean.dtype) * HALF_PI
+        noise = torch.randn_like(clean)
+        a, b = s.cos()[:, None], s.sin()[:, None]
+        v, cov, _, _ = self.net(a * clean + b * noise, s, context)
+        return vp_velocity_moment_loss(a * noise - b * clean, v, cov)
+
+
+def _whitened_likelihood_score(H, residual, covariance):
+    """Square-root solve for one or a batch of independent local likelihoods."""
+    L = safe_cholesky_spd(covariance.detach())
+    eye = torch.eye(L.shape[-1], dtype=L.dtype, device=L.device).expand_as(L)
+    q, upper = torch.linalg.qr(torch.cat((H @ L, eye), dim=-2), mode="reduced")
+    rhs = q[..., : H.shape[-2], :].transpose(-1, -2) @ residual
+    inner = torch.linalg.solve_triangular(upper, rhs, upper=True)
+    return torch.linalg.solve_triangular(L.transpose(-1, -2), inner, upper=True).squeeze(-1)
 
 
 def compute_noisy_los_guidance_o6(
@@ -325,12 +356,7 @@ def compute_noisy_los_guidance_o6(
 
     if not math.isfinite(sigma_u_rad) or sigma_u_rad <= 0:
         raise ValueError("sigma_u_rad must be positive and finite")
-    L_c = safe_cholesky_spd(C)
-    design = torch.cat((H @ L_c / sigma_u_rad, torch.eye(6, device=device, dtype=dtype)))
-    q, upper = torch.linalg.qr(design, mode="reduced")
-    rhs6 = q[:len(nu)].T @ (nu / sigma_u_rad)
-    inner = torch.linalg.solve_triangular(upper, rhs6.unsqueeze(-1), upper=True).squeeze(-1)
-    g0 = torch.linalg.solve_triangular(L_c.transpose(-2, -1), inner.unsqueeze(-1), upper=True).squeeze(-1)
+    g0 = _whitened_likelihood_score(H / sigma_u_rad, nu[:, None] / sigma_u_rad, C)
     if not bool(torch.isfinite(g0).all()):
         raise FloatingPointError("Non-finite angular likelihood gradient")
 
@@ -358,7 +384,7 @@ class ReverseODETrace:
     z_final: Tensor  # [P, 6] terminal whitened samples at s = 0
     states_final_si: Tensor  # [P, 6] decoded ECI SI orbit samples
     mean_state_si: Tensor  # [6] pre-registered sample mean point estimate
-    sample_cov_scaled: Tensor | None  # Unbiased sample covariance is undefined for P=1.
+    sample_cov_scaled: Tensor | None  # Empirical ensemble spread; undefined for P=1.
     carry_cov_scaled: Tensor  # Reference-regularized covariance used at the next epoch.
     s_midpoints: tuple[float, ...]
     z_trajectory: Tensor  # [K+1, P, 6]
@@ -414,15 +440,23 @@ def integrate_vp_reverse_pf_ode(
     )
 
 
-class VPOrbitDiffusionFilter(nn.Module):
-    """Route A Primary Model: Minimal 3+1 Knob Cosine-VP Conditional Orbital Diffusion Filter.
+@dataclass
+class OrbitStreamState:
+    epoch: float
+    initial_epoch: float
+    posterior: Tensor
+    reference_covariance: Tensor | None
+    particles: Tensor | None
+    history: Tensor | None
+    previous_innovation: Tensor
+    noise: RunningLOSNoise
+    generator: torch.Generator
+    ledger: ComputeLedger
+    count: int = 0
 
-    Core knobs (3 default + 1 optional compute budget):
-      - K (num_reverse_steps): artificial reverse diffusion intervals (default 4)
-      - P (num_particles): independent initial Gaussian seeds / trajectories (default 8)
-      - delta (min_ref_var_frac): shared floor for V_theta >= delta I and P_carry >= delta P_b^+ (default 0.10)
-      - B_los (los_budget): optional cap on raw fresh-batch LOS per likelihood call (None = use all fresh LOS)
-    """
+
+class VPOrbitDiffusionFilter(nn.Module):
+    """Shared angular reverse Markov chain with optional six-dimensional state diffusion."""
 
     def __init__(
         self,
@@ -430,12 +464,12 @@ class VPOrbitDiffusionFilter(nn.Module):
         num_reverse_steps: int = 4,
         num_particles: int = 8,
         delta: float = 0.10,
-        los_budget: int | None = None,
         guidance_mode: str = "vjp",
         fixed_isotropic_v: bool = False,
         context_dim: int = 64,
         hidden_dim: int = 96,
         default_sigma_rad: float = 5.0e-4,
+        known_initial: bool = False,
         dtype: torch.dtype = DTYPE,
     ) -> None:
         super().__init__()
@@ -443,14 +477,11 @@ class VPOrbitDiffusionFilter(nn.Module):
             raise ValueError(f"num_reverse_steps must be >= 1, got {num_reverse_steps}")
         if int(num_particles) < 1:
             raise ValueError(f"num_particles must be >= 1, got {num_particles}")
-        if los_budget is not None and int(los_budget) < 1:
-            raise ValueError(f"los_budget must be >= 1, got {los_budget}")
         if not (0.0 < float(delta) <= 1.0):
             raise ValueError(f"delta must lie in (0, 1], got {delta}")
         self.num_reverse_steps = int(num_reverse_steps)
         self.num_particles = int(num_particles)
         self.delta = float(delta)
-        self.los_budget = None if los_budget is None else int(los_budget)
         if guidance_mode not in ("vjp", "identity_jac", "none"):
             raise ValueError("Unknown likelihood guidance mode")
         self.guidance_mode = str(guidance_mode)
@@ -458,17 +489,27 @@ class VPOrbitDiffusionFilter(nn.Module):
         self.default_sigma_rad = float(default_sigma_rad)
 
         # Past-only causal context encoder (never fed current fresh batch Y!)
-        self.tracklet_encoder = ContinuousTrackletEncoder(context_dim=48, dtype=dtype)
+        self.tracklet_encoder = (
+            ContinuousTrackletEncoder(context_dim=48, dtype=dtype) if not known_initial else None
+        )
         # Context combines tracklet summary [48] + normalized prior state [6] + log diag(L_b) [6] + time/meta [4] = 64
         self.context_dim = int(context_dim)
-        self.prior_ctx_proj = nn.Linear(48 + 6 + 6 + 4, context_dim, dtype=dtype)
+        self.prior_ctx_proj = (
+            nn.Linear(48 + 6 + 6 + 4, context_dim, dtype=dtype) if not known_initial else None
+        )
+        self.known_initial = known_initial
+        self.sensor = AngularNoiseDiffusion(dtype)
         self.reference_prior = None
-        self.denoiser = CosineVPDenoiserNet(
-            context_dim=context_dim,
-            hidden_dim=hidden_dim,
-            delta=delta,
-            fixed_isotropic_v=fixed_isotropic_v,
-            dtype=dtype,
+        self.denoiser = (
+            CosineVPDenoiserNet(
+                context_dim=context_dim,
+                hidden_dim=hidden_dim,
+                delta=delta,
+                fixed_isotropic_v=fixed_isotropic_v,
+                dtype=dtype,
+            )
+            if not known_initial
+            else None
         )
         self.ledger = ComputeLedger()
 
@@ -494,375 +535,327 @@ class VPOrbitDiffusionFilter(nn.Module):
         valid_mask: Tensor | None,
         prev_assimilated_idx: int,
         sigma_u_rad: float,
+        past_summary: Tensor | None = None,
     ) -> Tensor:
         """Build strictly past-only context c^- excluding fresh unassimilated batch Y."""
         device = self.prior_ctx_proj.weight.device
         p_dtype = self.prior_ctx_proj.weight.dtype
-        if prev_assimilated_idx >= 0:
+        if past_summary is not None:
+            trk_ctx = past_summary
+        elif prev_assimilated_idx >= 0:
             trk_ctx, _ = self.tracklet_encoder.encode_prefix(
-                times_sec, observed_los, station_states_si, valid_mask,
-                up_to_idx=prev_assimilated_idx, sigma_u_rad=sigma_u_rad,
+                times_sec,
+                observed_los,
+                station_states_si,
+                valid_mask,
+                up_to_idx=prev_assimilated_idx,
+                init_time_sec=init_time_sec,
             )
         else:
             trk_ctx = torch.zeros((48,), device=device, dtype=p_dtype)
 
-        scale_phys = torch.tensor(
-            [EARTH_RADIUS_M] * 3 + [V_SCALE_MPS] * 3, device=device, dtype=torch.float64
+        count = (
+            prev_assimilated_idx + 1
+            if valid_mask is None
+            else int(torch.as_tensor(valid_mask)[: prev_assimilated_idx + 1].sum())
         )
-        x_norm = (prior_state_si.to(device=device, dtype=torch.float64) / scale_phys).to(p_dtype)
-        log_diag_L = torch.log(torch.diagonal(L_b).abs().clamp_min(1.0e-8)).to(device=device, dtype=p_dtype)
-        meta = torch.tensor(
-            [
-                (float(eval_time_sec) - float(init_time_sec)) / float(T_SCALE_S),
-                1.0 if prev_assimilated_idx >= 0 else 0.0,
-                math.log10(max(float(sigma_u_rad), 1.0e-7)),
-                math.log1p(max(0, prev_assimilated_idx + 1)),
-            ],
-            device=device,
-            dtype=p_dtype,
+        return self.state_context(
+            prior_state_si, L_b, eval_time_sec - init_time_sec, sigma_u_rad, count, trk_ctx
         )
-        return torch.tanh(self.prior_ctx_proj(torch.cat((trk_ctx.to(p_dtype), x_norm, log_diag_L, meta), dim=-1)))
 
-    def _select_fresh_batch_indices(self, fresh_indices: np.ndarray) -> np.ndarray:
-        if self.los_budget is None or fresh_indices.size <= self.los_budget:
-            return fresh_indices
-        sel = np.linspace(0, fresh_indices.size - 1, self.los_budget).round().astype(np.int64)
-        return np.unique(fresh_indices[sel])
+    def state_context(self, prior_state_si, L_b, elapsed, sigma, count, summary):
+        """Condition on strictly past observations and the propagated prior."""
+        scale = prior_state_si.new_tensor([EARTH_RADIUS_M] * 3 + [V_SCALE_MPS] * 3)
+        meta = prior_state_si.new_tensor(
+            [elapsed / T_SCALE_S, float(count > 0), math.log10(sigma), math.log1p(count)]
+        )
+        log_diag = torch.log(torch.diagonal(L_b).clamp_min(1.0e-8))
+        return torch.tanh(self.prior_ctx_proj(torch.cat((summary, prior_state_si / scale, log_diag, meta))))
 
-    def assimilate_fresh_batch(
+    def assimilate_frame(
+        self, prior, P_ref, P_carry, station, observed, noise_scale, noise_shape_eci, context, generator
+    ):
+        """Use exactly the current LOS in the reference update and the noisy-state VJP."""
+        scale = state_scale(device=prior.device, dtype=prior.dtype)
+        L = safe_cholesky_spd(P_carry)
+
+        def measurement(states):
+            rel = states[..., :3] - station[:3]
+            rho = rel.norm(dim=-1, keepdim=True).clamp_min(1.0)
+            ray = rel / rho
+            _, tangent = build_los_frame(ray)
+            Et = tangent.transpose(-1, -2)
+            Hpos = Et * scale[:3] / rho.unsqueeze(-1)
+            H = torch.cat((Hpos, torch.zeros_like(Hpos)), dim=-1)
+            residual = Et @ (observed - ray).unsqueeze(-1)
+            root = noise_scale * safe_cholesky_spd(Et @ noise_shape_eci @ tangent)
+            return (
+                torch.linalg.solve_triangular(root, H, upper=False),
+                torch.linalg.solve_triangular(root, residual, upper=False),
+            )
+
+        H, _ = measurement(prior)
+        ref_plus = whitened_reference_covariance_update(P_ref, H, 1.0)
+
+        def rhs(z, s):
+            with torch.inference_mode(False), torch.enable_grad():
+                z = z.detach().clone().requires_grad_(self.guidance_mode == "vjp")
+                velocity, _, clean, cov = self.denoiser(z, s, context)
+                if self.guidance_mode == "none":
+                    guide = torch.zeros_like(z)
+                else:
+                    states = prior + scale * (clean.detach() @ L.T)
+                    H, residual = measurement(states)
+                    J = H @ L
+                    # Two angular residuals per particle; batch all independent solves and VJPs.
+                    g0 = _whitened_likelihood_score(J, residual, cov)
+                    guide = (
+                        torch.autograd.grad(clean, z, grad_outputs=g0.detach())[0]
+                        if self.guidance_mode == "vjp"
+                        else g0
+                    )
+                return (
+                    (velocity - math.tan(s) * guide).detach(),
+                    clean.detach(),
+                    guide.norm(dim=-1).detach(),
+                )
+
+        # Marginally standard Gaussian seeds with zero ensemble mean prevent spurious
+        # random walks between arrivals. The covariance below is the ensemble's second moment.
+        count = self.num_particles
+        z = torch.randn((count, 6), device=prior.device, dtype=prior.dtype, generator=generator)
+        if count > 1:
+            z = (z - z.mean(0)) * math.sqrt(count / (count - 1))
+        z, mids, trajectory, means, norms = integrate_vp_reverse_pf_ode(
+            z, rhs, num_steps=self.num_reverse_steps
+        )
+        states = prior + scale * (z @ L.T)
+        mean = states.mean(0)
+        residuals = (states - mean) / scale
+        sample_cov = residuals.T @ residuals / len(states) if len(states) > 1 else None
+        carry = regularized_carryover_covariance(sample_cov, ref_plus, self.delta)
+        return ReverseODETrace(z, states, mean, sample_cov, carry, mids, trajectory, means, norms), ref_plus
+
+    @torch.no_grad()
+    def start_track(
         self,
+        initial_state_si,
+        init_time_sec,
         *,
-        prior_state_si: Tensor,
-        e_bar_b: Tensor,
-        P_ref_minus: Tensor,
-        eval_time_sec: float,
-        station_at_eval_pos_si: Tensor,
-        fresh_times_sec: Tensor,
-        fresh_stations_si: Tensor,
-        fresh_los_obs: Tensor,
-        context_past: Tensor,
-        sigma_u_rad: float,
-        P_carry_minus: Tensor | None = None,
-        num_steps: int | None = None,
-        num_particles: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> tuple[ReverseODETrace, Tensor]:
-        """Run K-interval reverse PF-ODE for P seeds guided ONLY by fresh LOS batch Y.
-
-        Returns:
-            trace: ReverseODETrace with P samples, sample mean, empirical sample covariance, and trajectory.
-            trace.carry_cov_scaled: regularized carryover covariance.
-            P_ref_plus: independent linearized reference covariance updated ONCE by Y.
-        """
-        device = prior_state_si.device
-        dtype = torch.float64
-        d_scale = state_scale(device=device, dtype=dtype)
-        K = self.num_reverse_steps if num_steps is None else int(num_steps)
-        P = self.num_particles if num_particles is None else int(num_particles)
-        if K < 1:
-            raise ValueError(f"num_steps must be >= 1, got {K}")
-        if P < 1:
-            raise ValueError(f"num_particles must be >= 1, got {P}")
-
-        P_carry_in = P_ref_minus if P_carry_minus is None else P_carry_minus
-        L_b = safe_cholesky_spd(P_carry_in.to(device=device, dtype=dtype))
-        eb = e_bar_b.to(device=device, dtype=dtype)
-        x_prior = prior_state_si.to(device=device, dtype=dtype)
-
-        # Single linearized reference update P_ref_plus using independent P_ref_minus and fresh batch Y
-        rep_ref = reproject_causal_window_single(
-            x_prior + d_scale * eb,
-            eval_time_sec,
-            station_at_eval_pos_si,
-            fresh_times_sec,
-            fresh_stations_si,
-            fresh_los_obs,
-            compute_jacobian=True,
-            ledger=self.ledger,
+        initial_ref_cov_scaled=None,
+        initial_station_si=None,
+        seed=20261028,
+    ):
+        x = torch.as_tensor(initial_state_si).to(self.sensor.net.v_head.weight)
+        t0 = float(init_time_sec)
+        if x.shape != (6,) or not math.isfinite(t0):
+            raise ValueError("Expected a six-dimensional initial state and finite epoch")
+        ref = hidden = None
+        if not self.known_initial:
+            station = (
+                x.new_zeros(6) if initial_station_si is None else torch.as_tensor(initial_station_si).to(x)
+            )
+            x, ref = self.initial_moments(x, station)
+            if initial_ref_cov_scaled is not None:
+                ref = torch.as_tensor(initial_ref_cov_scaled).to(x)
+            hidden = x.new_zeros(self.tracklet_encoder.context_dim)
+        return OrbitStreamState(
+            t0,
+            t0,
+            x,
+            ref,
+            None,
+            hidden,
+            x.new_zeros(3),
+            RunningLOSNoise(default_sigma_rad=self.default_sigma_rad),
+            torch.Generator(device=x.device).manual_seed(int(seed)),
+            ComputeLedger(),
         )
-        assert rep_ref.A_scaled_d is not None
-        P_ref_plus = whitened_reference_covariance_update(P_ref_minus, rep_ref.A_scaled_d, sigma_u_rad)
-        if not bool(torch.isfinite(P_ref_plus).all()):
-            P_ref_plus = P_ref_minus
-
-        z_init = torch.randn((P, 6), generator=generator, device=device, dtype=dtype)
-
-        def _rhs(z_batch: Tensor, s_bar: float) -> tuple[Tensor, Tensor, Tensor]:
-            tan_s = math.tan(s_bar)
-            f_list, m_list, gn_list = [], [], []
-            for p_idx in range(P):
-                with torch.inference_mode(False), torch.enable_grad():
-                    z_p = z_batch[p_idx].detach().clone().requires_grad_(self.guidance_mode == "vjp")
-                    v_th, _, m_s, C_s = self.denoiser(z_p, s_bar, context_past)
-                    if self.guidance_mode == "none" or fresh_times_sec.numel() == 0:
-                        g_loc = torch.zeros_like(z_p)
-                    else:
-                        x_m = (x_prior + d_scale * (eb + L_b @ m_s.detach())).detach()
-                        rep_m = reproject_causal_window_single(
-                            x_m,
-                            eval_time_sec,
-                            station_at_eval_pos_si,
-                            fresh_times_sec,
-                            fresh_stations_si,
-                            fresh_los_obs,
-                            compute_jacobian=True,
-                            ledger=self.ledger,
-                        )
-                        assert rep_m.A_scaled_d is not None
-                        H_z0 = rep_m.A_scaled_d @ L_b  # [2N_Y, 6]
-                        g_loc = compute_noisy_los_guidance_o6(
-                            z_p,
-                            m_s,
-                            C_s,
-                            H_z0=H_z0,
-                            nu_res=rep_m.nu_0,
-                            sigma_u_rad=sigma_u_rad,
-                            guidance_mode=self.guidance_mode,
-                        )
-                f_p = v_th.detach() - tan_s * g_loc.detach()
-                f_list.append(f_p)
-                m_list.append(m_s.detach())
-                gn_list.append(torch.linalg.vector_norm(g_loc.detach()))
-            return torch.stack(f_list, dim=0), torch.stack(m_list, dim=0), torch.stack(gn_list, dim=0)
-
-        z_fin, mids, z_traj, m_traj, g_norms = integrate_vp_reverse_pf_ode(
-            z_init, _rhs, num_steps=K
-        )
-        # Decode P terminal samples to ECI SI: x = x^- + D (e_bar_b + L_b z_0)
-        deltas_scaled = eb.unsqueeze(0) + (z_fin @ L_b.transpose(0, 1))
-        states_si = x_prior.unsqueeze(0) + deltas_scaled * d_scale.unsqueeze(0)
-        mean_state_si = states_si.mean(dim=0)
-        if P > 1:
-            centered = (states_si - mean_state_si.unsqueeze(0)) / d_scale.unsqueeze(0)
-            P_samples = (centered.transpose(0, 1) @ centered) / float(P - 1)
-            if not bool(torch.isfinite(P_samples).all()):
-                P_samples = None
-        else:
-            P_samples = None
-
-        P_carry_plus = regularized_carryover_covariance(P_samples, P_ref_plus, self.delta)
-        if not bool(torch.isfinite(P_carry_plus).all()):
-            P_carry_plus = P_ref_plus
-
-        trace = ReverseODETrace(
-            z_final=z_fin,
-            states_final_si=states_si,
-            mean_state_si=mean_state_si,
-            sample_cov_scaled=P_samples,
-            carry_cov_scaled=P_carry_plus,
-            s_midpoints=mids,
-            z_trajectory=z_traj,
-            m_trajectory=m_traj,
-            guidance_norms=g_norms,
-        )
-        return trace, P_ref_plus
 
     @torch.inference_mode(False)
+    @torch.no_grad()
+    def step(
+        self,
+        state,
+        time_sec,
+        observed_los,
+        station_state_si,
+        *,
+        station_id=None,
+        station_id_reliable=None,
+        training_prior_only=False,
+    ):
+        """Advance one track in place and return this arrival's prediction and posterior."""
+        now = float(time_sec)
+        dt = now - state.epoch
+        if not math.isfinite(dt) or dt < 0:
+            raise ValueError("Observation times must be finite and nondecreasing")
+        station = torch.as_tensor(station_state_si).to(state.posterior)
+        obs = torch.as_tensor(observed_los).to(state.posterior)
+        prior, phi = propagate_si_with_stm(
+            state.posterior, dt, compute_stm=not self.known_initial, ledger=state.ledger
+        )
+        ref = carry = None
+        if phi is not None:
+            ref = propagate_reference_covariance_stm(state.reference_covariance, phi)
+            spread = None
+            if state.particles is not None:
+                pushed, _ = propagate_si_with_stm(
+                    state.particles, dt, compute_stm=False, ledger=state.ledger
+                )
+                prior = pushed.mean(0)
+                if len(pushed) > 1:
+                    centered = (pushed - prior) / state_scale(device=prior.device, dtype=prior.dtype)
+                    spread = centered.T @ centered / len(pushed)
+            carry = regularized_carryover_covariance(spread, ref, self.delta)
+        raw = nn.functional.normalize(obs, dim=0)
+        ray = nn.functional.normalize(prior[:3] - station[:3], dim=0)
+        _, tangent = build_los_frame(ray)
+        sigma = state.noise.sigma
+        sensor_ctx = self.sensor.context(ray, station, state.previous_innovation, dt, sigma)
+        result = dict(
+            prior_state_si=prior,
+            P_ref_in=ref,
+            P_carry_in=carry,
+            tangent=tangent,
+            sensor_context=sensor_ctx,
+            sigma_past_rad=sigma,
+        )
+        posterior = prior
+        if not training_prior_only:
+            bias, R = self.sensor.moments(
+                sensor_ctx, self.num_reverse_steps, self.num_particles, state.generator
+            )
+            innovation = tangent.T @ (raw - ray)
+            noise_bias = tangent @ (sigma * bias)
+            root = sigma * safe_cholesky_spd(R)
+            white = torch.linalg.solve_triangular(root, (innovation - sigma * bias)[:, None], upper=False)
+            result.update(
+                predicted_los=nn.functional.normalize(ray + noise_bias, dim=0),
+                angular_covariance=sigma**2 * R,
+                observation_nll=0.5 * white.square().sum()
+                + root.diag().log().sum()
+                + math.log(2 * math.pi),
+            )
+            if not self.known_initial:
+                ctx = self.state_context(
+                    prior,
+                    safe_cholesky_spd(carry),
+                    now - state.initial_epoch,
+                    sigma,
+                    state.count,
+                    state.history,
+                )
+                shape = tangent @ R @ tangent.T + (R.trace() / 2) * torch.outer(ray, ray)
+                trace, ref = self.assimilate_frame(
+                    prior,
+                    ref,
+                    carry,
+                    station,
+                    nn.functional.normalize(raw - noise_bias, dim=0),
+                    sigma,
+                    shape,
+                    ctx,
+                    state.generator,
+                )
+                state.particles = trace.states_final_si
+                posterior = trace.mean_state_si
+                result.update(trace=trace, P_ref=ref, P_carry=trace.carry_cov_scaled)
+        if state.history is not None:
+            state.history = self.tracklet_encoder.advance(state.history, raw, station, dt)
+        state.posterior, state.reference_covariance, state.epoch = posterior, ref, now
+        state.previous_innovation = raw - nn.functional.normalize(posterior[:3] - station[:3], dim=0)
+        state.noise.observe(
+            now,
+            obs.detach().cpu().numpy(),
+            station.detach().cpu().numpy(),
+            None if station_id is None else int(station_id),
+            None if station_id_reliable is None else bool(station_id_reliable),
+        )
+        state.count += 1
+        result["posterior_state_si"] = posterior
+        return result
+
     @torch.no_grad()
     def rollout_track(
         self,
         *,
-        initial_state_si: Tensor,
-        init_time_sec: float,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        valid_mask: Tensor | None = None,
-        initial_ref_cov_scaled: Tensor | None = None,
-        initial_station_si: Tensor | None = None,
-        seed: int = 20261028,
-        explicit_flush: bool = False,
-        block_start_time_sec: float | None = None,
-        readout_until_sec: float | None = None,
-        station_ids: Tensor | None = None,
-        station_id_reliable: Tensor | None = None,
-    ) -> dict[str, Any]:
-        """Full multi-block online rollout propagating all P particles independently across gaps."""
-        device = self.prior_ctx_proj.weight.device
-        dtype = torch.float64
-        d_scale = state_scale(device=device, dtype=dtype)
-        gen = torch.Generator(device=device).manual_seed(int(seed))
-
-        x0 = initial_state_si.to(device=device, dtype=dtype)
-        t_cpu = times_sec.detach().to("cpu", dtype=dtype)
-        T = int(t_cpu.shape[0])
-        val_cpu = (
-            torch.ones((T,), dtype=torch.bool)
-            if valid_mask is None
-            else valid_mask.detach().to("cpu", dtype=torch.bool)
+        initial_state_si,
+        init_time_sec,
+        times_sec,
+        observed_los,
+        station_states_si,
+        valid_mask=None,
+        initial_ref_cov_scaled=None,
+        initial_station_si=None,
+        station_ids=None,
+        station_id_reliable=None,
+        seed=20261028,
+        return_traces=False,
+        training_pairs=False,
+        pure_prior=False,
+    ):
+        state = self.start_track(
+            initial_state_si,
+            init_time_sec,
+            initial_station_si=initial_station_si,
+            initial_ref_cov_scaled=initial_ref_cov_scaled,
+            seed=seed,
         )
-        obs = observed_los.to(device=device, dtype=dtype)
-        stn = station_states_si.to(device=device, dtype=dtype)
-
-        val_indices_all = np.flatnonzero(val_cpu.numpy())
-        station_at_init = (x0.new_zeros(6) if initial_station_si is None else
-                           torch.as_tensor(initial_station_si, device=device, dtype=dtype))
-        x0, P_ref = self.initial_moments(x0, station_at_init)
-        if initial_ref_cov_scaled is not None:
-            P_ref = initial_ref_cov_scaled.to(device=device, dtype=dtype)
-        P_carry = P_ref.clone()
-        e_bar = torch.zeros((6,), device=device, dtype=dtype)
-
-        particles_si: Tensor | None = None
-        curr_anchor_x = x0
-        curr_anchor_t = float(init_time_sec)
-        prev_assimilated_idx = -1
-
-        block2_t30_state: Tensor | None = None
-        block2_t30_time: float | None = None
-        batch_traces: list[dict[str, Any]] = []
-
-        assim_events = causal_diffusion_events(
-            t_cpu, val_cpu, init_time_sec, block_start_time_sec,
-            explicit_flush=explicit_flush, readout_until_sec=readout_until_sec,
+        x = state.posterior
+        n = len(times_sec)
+        priors, posts = x.new_zeros((n, 6)), x.new_zeros((n, 6))
+        nll, predicted, cov = x.new_zeros(n), x.new_zeros((n, 3)), x.new_zeros((n, 2, 2))
+        traces, pairs = [], []
+        for frame in observation_frames(times_sec, valid_mask, init_time_sec):
+            k = frame.index
+            out = self.step(
+                state,
+                frame.time_sec,
+                observed_los[k],
+                station_states_si[k],
+                station_id=None if station_ids is None else station_ids[k],
+                station_id_reliable=None if station_id_reliable is None else station_id_reliable[k],
+                training_prior_only=pure_prior,
+            )
+            priors[k], posts[k] = out["prior_state_si"], out["posterior_state_si"]
+            if not pure_prior:
+                nll[k], predicted[k], cov[k] = (
+                    out["observation_nll"],
+                    out["predicted_los"],
+                    out["angular_covariance"],
+                )
+            if training_pairs:
+                pairs.append(
+                    (
+                        frame,
+                        priors[k],
+                        out["P_carry_in"],
+                        out["tangent"],
+                        out["sensor_context"],
+                        out["sigma_past_rad"],
+                    )
+                )
+            if return_traces and "trace" in out:
+                traces.append(
+                    dict(
+                        out,
+                        eval_time_sec=frame.time_sec,
+                        last_obs_idx=k,
+                        prev_assimilated_idx=frame.previous_index,
+                    )
+                )
+        return dict(
+            prior_states_si=priors,
+            posterior_states_si=posts,
+            observation_nll=nll,
+            predicted_los=predicted,
+            angular_covariance=cov,
+            processed_frames=state.count,
+            batch_traces=traces,
+            training_pairs=pairs,
+            ledger=state.ledger.as_dict(),
         )
-
-        event_anchors: list[tuple[float, Tensor, Tensor]] = []
-        for ev_t, last_idx, is_b2_ep in assim_events:
-            dt = float(ev_t) - curr_anchor_t
-            if abs(dt) > 0.0:
-                prev_anchor_x = curr_anchor_x
-                x_ref_prop, phi_gap = propagate_si_with_stm(
-                    prev_anchor_x, dt, compute_stm=True, ledger=self.ledger
-                )
-                assert phi_gap is not None
-                if particles_si is not None:
-                    # Propagate all P particles independently across gap via two-body RK4!
-                    particles_si, _ = propagate_si_with_stm(
-                        particles_si, dt, compute_stm=False, ledger=self.ledger
-                    )
-                    curr_anchor_x = particles_si.mean(dim=0)
-                    centered = (particles_si - curr_anchor_x.unsqueeze(0)) / d_scale.unsqueeze(0)
-                    P_samp_prop = (
-                        (centered.transpose(0, 1) @ centered) / float(particles_si.shape[0] - 1)
-                        if particles_si.shape[0] > 1
-                        else None
-                    )
-                else:
-                    curr_anchor_x = x_ref_prop
-                    P_samp_prop = None
-                P_ref = propagate_reference_covariance_stm(P_ref, phi_gap)
-                P_carry = regularized_carryover_covariance(P_samp_prop, P_ref, self.delta)
-                curr_anchor_t = float(ev_t)
-
-            event_prior = curr_anchor_x
-            # Collect strictly fresh observations arriving after prev_assimilated_idx
-            if last_idx > prev_assimilated_idx:
-                prior_before_assim = curr_anchor_x.detach().clone()
-                P_carry_in = P_carry.detach().clone()
-                P_ref_in = P_ref.detach().clone()
-                prev_before_assim = prev_assimilated_idx
-
-                fresh_all = val_indices_all[
-                    (val_indices_all > prev_assimilated_idx) & (val_indices_all <= last_idx)
-                ]
-                fresh_idx = self._select_fresh_batch_indices(fresh_all)
-
-                # Strict separation: sigma_past uses ONLY <= prev_assimilated_idx (zero leak into c^-!),
-                # while sigma_meas calibrates measurement noise R for fresh batch Y.
-                if prev_assimilated_idx >= 0:
-                    _, sigma_past, _ = estimate_online_los_noise_floor(
-                        t_cpu, obs.detach().cpu(), valid_mask=val_cpu, up_to_idx=prev_assimilated_idx,
-                        default_sigma_rad=self.default_sigma_rad,
-                        station_states_si=stn.detach().cpu(),
-                        station_ids=station_ids, station_id_reliable=station_id_reliable,
-                    )
-                else:
-                    sigma_past = self.default_sigma_rad
-                fresh_mask = val_cpu.clone()
-                fresh_mask[:prev_assimilated_idx+1] = False
-                _, sigma_meas, _ = estimate_online_los_noise_floor(
-                    t_cpu, obs.detach().cpu(), valid_mask=fresh_mask, up_to_idx=last_idx,
-                    default_sigma_rad=sigma_past, station_states_si=stn.detach().cpu(),
-                    station_ids=station_ids, station_id_reliable=station_id_reliable,
-                )
-                L_carry = safe_cholesky_spd(P_carry)
-                ctx_past = self.build_causal_past_context(
-                    prior_state_si=curr_anchor_x,
-                    L_b=L_carry,
-                    eval_time_sec=curr_anchor_t,
-                    init_time_sec=float(init_time_sec),
-                    times_sec=t_cpu,
-                    observed_los=obs,
-                    station_states_si=stn,
-                    valid_mask=val_cpu,
-                    prev_assimilated_idx=prev_assimilated_idx,
-                    sigma_u_rad=sigma_past,
-                )
-                trace, P_ref = self.assimilate_fresh_batch(
-                    prior_state_si=curr_anchor_x,
-                    e_bar_b=e_bar,
-                    P_carry_minus=P_carry,
-                    P_ref_minus=P_ref,
-                    eval_time_sec=curr_anchor_t,
-                    station_at_eval_pos_si=stn[int(fresh_idx[-1]), :3],
-                    fresh_times_sec=t_cpu[fresh_idx].to(device=device),
-                    fresh_stations_si=stn[fresh_idx],
-                    fresh_los_obs=obs[fresh_idx],
-                    context_past=ctx_past,
-                    sigma_u_rad=sigma_meas,
-                    generator=gen,
-                )
-                particles_si = trace.states_final_si
-                curr_anchor_x = trace.mean_state_si
-                P_carry = trace.carry_cov_scaled
-                prev_assimilated_idx = last_idx
-                batch_traces.append(
-                    {
-                        "eval_time_sec": curr_anchor_t,
-                        "last_obs_idx": last_idx,
-                        "prev_assimilated_idx": prev_before_assim,
-                        "sigma_past_rad": sigma_past,
-                        "sigma_meas_rad": sigma_meas,
-                        "prior_state_si": prior_before_assim,
-                        "posterior_state_si": curr_anchor_x.detach().clone(),
-                        "P_carry_in": P_carry_in,
-                        "P_carry": P_carry.detach().clone(),
-                        "P_ref_in": P_ref_in,
-                        "P_ref": P_ref.detach().clone(),
-                        "trace": trace,
-                    }
-                )
-
-            if is_b2_ep:
-                block2_t30_state = curr_anchor_x.detach().clone()
-                block2_t30_time = curr_anchor_t
-            published = curr_anchor_x.unsqueeze(0) if particles_si is None else particles_si
-            event_anchors.append((curr_anchor_t, published, event_prior))
-
-        # Render per-frame causal states along times_sec
-        priors_seq, posts_seq = [], []
-        anc_ptr = 0
-        act_x, act_t = x0.unsqueeze(0), float(init_time_sec)
-        for k in range(T):
-            if not bool(val_cpu[k].item()):
-                priors_seq.append(torch.zeros_like(x0))
-                posts_seq.append(torch.zeros_like(x0))
-                continue
-            tk = float(t_cpu[k].item())
-            # A past event between two frames affects both prior and posterior of
-            # the later frame. An event exactly at tk affects only its posterior.
-            while anc_ptr < len(event_anchors) and event_anchors[anc_ptr][0] < tk:
-                act_t, act_x, _ = event_anchors[anc_ptr]
-                anc_ptr += 1
-            if anc_ptr < len(event_anchors) and event_anchors[anc_ptr][0] == tk:
-                act_t, act_x, pr_k = event_anchors[anc_ptr]
-                anc_ptr += 1
-                po_k = act_x.mean(dim=0)
-            else:
-                pushed, _ = propagate_si_with_stm(act_x, tk-act_t, compute_stm=False, ledger=self.ledger)
-                pr_k = po_k = pushed.mean(dim=0)
-            priors_seq.append(pr_k)
-            posts_seq.append(po_k)
-
-        return {
-            "prior_states_si": torch.stack(priors_seq, dim=0),
-            "posterior_states_si": torch.stack(posts_seq, dim=0),
-            "batch_traces": batch_traces,
-            "block2_t30_state_si": block2_t30_state,
-            "block2_t30_time_sec": block2_t30_time,
-            "ledger": self.ledger.as_dict(),
-        }
 
     def forward_filter_sequence(
         self,
@@ -878,7 +871,7 @@ class VPOrbitDiffusionFilter(nn.Module):
         unbatched = initial_state_si.ndim == 1
         init_x = initial_state_si.unsqueeze(0) if unbatched else initial_state_si
         batch = int(init_x.shape[0])
-        device = self.prior_ctx_proj.weight.device
+        device = self.sensor.net.v_head.weight.device
         init_t = torch.as_tensor(init_time_sec, dtype=torch.float64).reshape(-1)
         if init_t.numel() == 1:
             init_t = init_t.expand(batch)
@@ -900,13 +893,20 @@ class VPOrbitDiffusionFilter(nn.Module):
                 observed_los=obs_seq[b],
                 station_states_si=stn_seq[b],
                 valid_mask=val_seq[b],
+                **{
+                    key: (
+                        kwargs[key]
+                        if unbatched and torch.as_tensor(kwargs[key]).ndim == 1
+                        else kwargs[key][b]
+                    )
+                    for key in ("station_ids", "station_id_reliable", "initial_station_si")
+                    if kwargs.get(key) is not None
+                },
             )
             pr, po = res["prior_states_si"], res["posterior_states_si"]
             vb = val_seq[b].to(device=device)
             obs_b = obs_seq[b].to(device=device, dtype=torch.float64)
-            stn_b = stn_seq[b].to(device=device, dtype=torch.float64)
-            rel = pr[:, :3] - stn_b[:, :3]
-            u_hat = rel / torch.linalg.vector_norm(rel, dim=-1, keepdim=True).clamp_min(1.0)
+            u_hat = res["predicted_los"]
             u_hat = torch.where(vb.unsqueeze(-1), u_hat, torch.zeros_like(u_hat))
             inn = torch.where(vb.unsqueeze(-1), obs_b - u_hat, torch.zeros_like(obs_b))
             priors_b.append(pr)
@@ -935,11 +935,12 @@ class VPOrbitDiffusionFilter(nn.Module):
             predicted_los=preds,
             valid_mask=val_dev,
             metadata={
-                "model_family": "route_a_vp_orbit_diffusion",
+                "model_family": "known_initial_angular_diffusion"
+                if self.known_initial
+                else "route_a_vp_orbit_diffusion",
                 "K": self.num_reverse_steps,
                 "P": self.num_particles,
                 "delta": self.delta,
-                "B_los": self.los_budget,
             },
         )
 
@@ -1201,6 +1202,8 @@ class RouteBTwistedDiffusionSMC:
 
 
 __all__ = [
+    "AngularNoiseDiffusion",
+    "OrbitStreamState",
     "CosineVPDenoiserNet",
     "HALF_PI",
     "ReverseODETrace",

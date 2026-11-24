@@ -17,7 +17,7 @@ param(
     [double]$Lr = 0.001,
     [int[]]$Seeds = @(20261028, 20261029, 20261030),
     [int]$SplitSeed = $(if ($env:SPLIT_SEED) { [int]$env:SPLIT_SEED } else { 20261028 }),
-    [ValidateSet("all", "test", "classical", "abl_3x2", "ltr_lm", "fd_asf", "paired_val")]
+    [ValidateSet("all", "test", "main", "classical", "abl_3x2", "ltr_lm", "fd_asf", "paired_val")]
     [string]$Stage = "all",
     [int]$MaxRecordsPerEpoch = 0,
     [int]$MaxEvalRecords = 0,
@@ -60,6 +60,13 @@ $CommonArgs = @(
     "--max-records-per-epoch", "$MaxRecordsPerEpoch",
     "--max-eval-records", "$MaxEvalRecords"
 )
+
+if ($Stage -in @("all", "main")) {
+    foreach ($seed in $Seeds) {
+        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v1.py" @CommonArgs --arch diffusion --run-dir $runDir --seed $seed --epochs $Epochs --lr $Lr --batch-size $BatchSize
+    }
+}
 
 if ($Stage -in @("all", "classical")) {
     foreach ($arch in @("cl_gn1_pure", "cl_gn1_matched", "cl_window_lm", "cl_full_prefix_wls")) {
@@ -115,6 +122,14 @@ if ($Stage -in @("all", "fd_asf")) {
 }
 
 if ($RunPairedVal -or ($Stage -eq "paired_val")) {
+    foreach ($seed in $Seeds) {
+        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        $best = Join-Path $runDir "best.pt"
+        if (-not (Test-Path -LiteralPath $best -PathType Leaf)) { throw "Missing required checkpoint: $best" }
+        Invoke-ExperimentPython "$V6Dir\scripts\validate_v1.py" @CommonArgs --arch diffusion --run-dir $runDir --resume $best --eval-split paired_val
+    }
+}
+if ($RunPairedVal -and ($Stage -eq "all")) {
     Write-Host "[V1][Stage 5] Running locked paired replication on historical VAL..."
     Invoke-ExperimentPython "$V6Dir\scripts\validate_v1.py" @CommonArgs `
         --run-dir "$OutputRoot\stage1_classical\cl_gn1_matched" --arch cl_gn1_matched --eval-split paired_val

@@ -9,13 +9,24 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
-from ..data.observation_clock import causal_diffusion_events
+from ..data.observation_clock import observation_frames
 
+from .batched_physics import MU_EARTH_M3_S2
 from .diffusion_orbit import HALF_PI, RouteBGuidedCosineFlow2D, RouteBTwistedDiffusionSMC
-from .reprojection import build_los_frame, estimate_online_los_noise_floor, propagate_si_with_stm
+from .reprojection import (
+    build_los_frame,
+    estimate_online_los_noise_floor,
+    los_noise_profile,
+    propagate_si_with_stm,
+)
 from .v1_fd_asf import (
-    SIN_15_DEG, AttributableChart2Plus4, ContinuousTrackletEncoder, LambertChart2Plus4,
-    check_bound_perigee_feasible, compute_forecast_disagreement_weights,
+    MIN_PERIGEE_RADIUS_M,
+    SIN_15_DEG,
+    AttributableChart2Plus4,
+    ContinuousTrackletEncoder,
+    LambertChart2Plus4,
+    check_bound_perigee_feasible,
+    compute_forecast_disagreement_weights,
 )
 
 
@@ -53,7 +64,9 @@ class ChartPrefix:
         return states, logdet, valid & torch.isfinite(states).all(-1) & torch.isfinite(logdet)
 
 
-def build_chart_prefix(encoder, flow, record, last_index, *, device, los_budget=None):
+def build_chart_prefix(
+    encoder, flow, record, last_index, *, device, los_budget=None, context=None, sigma=None
+):
     times = torch.as_tensor(record["times_sec"], dtype=torch.float64, device="cpu")
     n = last_index + 1
     mask = torch.as_tensor(record.get("valid_mask", torch.ones_like(times, dtype=torch.bool)),
@@ -66,10 +79,15 @@ def build_chart_prefix(encoder, flow, record, last_index, *, device, los_budget=
     stn = torch.as_tensor(record["station_states_si"], dtype=torch.float64, device=device)
     station_ids = record.get("station_ids")
     reliable = record.get("station_id_reliable")
-    _, sig, _ = estimate_online_los_noise_floor(times, obs.detach().cpu(), station_ids,
-                                                 reliable, mask, up_to_idx=k, station_states_si=stn)
-    ctx, _ = encoder.encode_prefix(times, obs, stn, mask, up_to_idx=k, sigma_u_rad=sig)
+    sig = sigma
+    if sig is None:
+        _, sig, _ = estimate_online_los_noise_floor(
+            times, obs.detach().cpu(), station_ids, reliable, mask, up_to_idx=k, station_states_si=stn
+        )
     t_ref = float(record["init_time_sec"])
+    ctx = context
+    if ctx is None:
+        ctx, _ = encoder.encode_prefix(times, obs, stn, mask, up_to_idx=k, init_time_sec=t_ref)
     tk = times[k].item()
     x0 = torch.as_tensor(record["initial_state_si"], dtype=torch.float64, device=device)
     xk, _ = propagate_si_with_stm(x0, tk - t_ref, compute_stm=False)
@@ -96,7 +114,8 @@ def build_chart_prefix(encoder, flow, record, last_index, *, device, los_budget=
     scale_rate = math.sqrt(2) * sig / (dt * attr.omega_ref_rad_s) if 0 < dt <= 60 and same_station else 1.
     eta_std = obs.new_tensor([sig, sig, scale_rate, scale_rate])
     # The nominal orbit and station history select the chart, independently of proposed samples.
-    if bool((torch.diff(times[idx]) > 60).any()):
+    min_period = 2 * math.pi * math.sqrt(MIN_PERIGEE_RADIUS_M**3 / MU_EARTH_M3_S2)
+    if 1.0 < tk - float(times[first]) < min_period:
         xa, _ = propagate_si_with_stm(x0, times[first].item() - t_ref, compute_stm=False)
         r1, r2 = xa[:3], xk[:3]
         sine = torch.linalg.cross(r1, r2).norm() / (r1.norm() * r2.norm()).clamp_min(1.)
@@ -114,7 +133,7 @@ def build_chart_prefix(encoder, flow, record, last_index, *, device, los_budget=
     return ChartPrefix(chart, ctx, idx, eta_std, sig, k, first)
 
 
-def prefix_nll(states, prefix, record):
+def prefix_nll(states, prefix, record, *, all_observations=False, return_states=False):
     """Stable spherical chord likelihood, using one chronological sweep per orbit."""
     device = states.device
     times = torch.as_tensor(record["times_sec"], dtype=states.dtype, device="cpu")
@@ -122,21 +141,35 @@ def prefix_nll(states, prefix, record):
     stn = torch.as_tensor(record["station_states_si"], dtype=states.dtype, device=device)
     t = float(record["init_time_sec"])
     cost = states.new_zeros(len(states))
-    for k in prefix.indices.tolist():
+    indices = prefix.indices.tolist()
+    if all_observations:
+        mask = torch.as_tensor(record.get("valid_mask", torch.ones(len(times), dtype=torch.bool))).cpu()
+        indices = torch.nonzero(mask[: prefix.center_index + 1], as_tuple=True)[0].tolist()
+    sigma_history = record.get("los_sigma_by_frame")
+    for k in indices:
         tk = times[k].item()
         states, _ = propagate_si_with_stm(states, tk-t, compute_stm=False)
         t = tk
         los = torch.nn.functional.normalize(states[:, :3] - stn[k, :3], dim=-1)
-        cost = cost + (los - torch.nn.functional.normalize(obs[k], dim=0)).square().sum(-1)
-    return cost / (2 * prefix.sigma**2)
+        sigma = prefix.sigma if sigma_history is None else sigma_history[k]
+        cost = cost + (los - torch.nn.functional.normalize(obs[k], dim=0)).square().sum(-1) / (
+            2 * sigma**2
+        )
+    return (cost, states) if return_states else cost
 
 
-def chart_log_target(z, eta, branch, prefix, record):
+def chart_log_target(z, eta, branch, prefix, record, *, at_frame=False):
     states, ld, valid = prefix.decode(z, eta, branch, volume=True)
     valid = valid & check_bound_perigee_feasible(states)
     log_target = z.new_full((len(z),), -torch.inf)
     if bool(valid.any()):
-        log_target[valid] = ld[valid] - prefix_nll(states[valid], prefix, record)
+        cost, terminal = prefix_nll(
+            states[valid], prefix, record, all_observations=True, return_states=True
+        )
+        log_target[valid] = ld[valid] - cost
+        if at_frame:
+            states = states.clone()
+            states[valid] = terminal
     return states, log_target
 
 
@@ -161,13 +194,20 @@ def draw_chart_teacher(encoder, flow, record, *, num_ref_candidates, device, los
     )
     if num_ref_candidates < 1:
         raise ValueError("num_ref_candidates must be positive")
-    events = causal_diffusion_events(times, valid, t_init, record.get("block_start_time_sec"),
-                                     readout_until_sec=record.get("readout_until_sec"))
-    available = list(dict.fromkeys(k for _, k, _ in events if k >= 0))
-    if not available:
-        raise EmptyTeacherSupport("No prefix ready for publication")
-    k = random.choice(available)
+    frames = list(observation_frames(times, valid, t_init))
+    if not frames:
+        raise EmptyTeacherSupport("No valid observation frame")
+    k = random.choice([f.index for f in frames])
     prefix = build_chart_prefix(encoder, flow, record, k, device=dev, los_budget=los_budget)
+    sigma_history, _ = los_noise_profile(
+        times[: k + 1],
+        record["observed_los"][: k + 1],
+        None if record.get("station_ids") is None else record["station_ids"][: k + 1],
+        None if record.get("station_id_reliable") is None else record["station_id_reliable"][: k + 1],
+        valid[: k + 1],
+        station_states_si=stn[: k + 1],
+    )
+    record = {**record, "los_sigma_by_frame": sigma_history}
     ic, ia = prefix.center_index, prefix.first_index
     chart = prefix.chart
     rel = truth[ic, :3] - stn[ic, :3]
@@ -198,41 +238,25 @@ def draw_chart_teacher(encoder, flow, record, *, num_ref_candidates, device, los
         if not bool(supported.any()):
             raise EmptyTeacherSupport("No physically admissible teacher particle in this prefix")
         log_weight = log_target[supported] - log_ref[supported]
-        # Use an announced viewing geometry if supplied by the operator. The fallback
-        # forecasts the present platform at a fixed horizon without reading future rows.
         schedule = record.get("scheduled_forecasts", {}).get(k)
-        if schedule is None:
-            t_next = float(times[k]) + 300.
-            next_station, _ = propagate_si_with_stm(stn[k], 300., compute_stm=False)
+        later = torch.nonzero(valid[k + 1 :], as_tuple=True)[0]
+        if schedule is not None or len(later):
+            if schedule is None:
+                # Training label only. The proposal and its context saw only the prefix through k.
+                nxt = k + 1 + int(later[0])
+                t_next, station = float(times[nxt]), stn[nxt]
+            else:
+                t_next, station = schedule
+            w_star, w_pi, _ = compute_forecast_disagreement_weights(
+                states[supported],
+                log_weight,
+                t_ref_sec=t_init,
+                next_view_time_sec=t_next,
+                next_station_pos_si=torch.as_tensor(station).to(stn)[:3],
+            )
         else:
-            t_next, station = schedule
-            next_station = torch.as_tensor(station, device=dev, dtype=dtype)
-        w_star, w_pi, _ = compute_forecast_disagreement_weights(
-            states[supported], log_weight, t_ref_sec=t_init, next_view_time_sec=t_next,
-            next_station_pos_si=next_station[:3])
+            w_pi = w_star = torch.softmax(log_weight, dim=0)
     return z[supported], branch[supported], eta[supported], w_star, w_pi, prefix.context
-
-
-def render_reference_orbits(prior, t_ref, times, mask, anchors):
-    """Propagate the latest published reference orbit to each frame, preserving pre-update values."""
-    ref, ptr = prior, 0
-    priors, posts = [], []
-    for k, tk in enumerate(times.tolist()):
-        if not mask[k]:
-            priors.append(torch.zeros_like(prior))
-            posts.append(torch.zeros_like(prior))
-            continue
-        while ptr < len(anchors) and anchors[ptr][0] < tk:
-            ref = anchors[ptr][1]
-            ptr += 1
-        pred, _ = propagate_si_with_stm(ref, tk-t_ref, compute_stm=False)
-        priors.append(pred)
-        if ptr < len(anchors) and anchors[ptr][0] == tk:
-            ref = anchors[ptr][1]
-            ptr += 1
-            pred, _ = propagate_si_with_stm(ref, tk-t_ref, compute_stm=False)
-        posts.append(pred)
-    return torch.stack(priors), torch.stack(posts)
 
 
 class RouteBOrbitFilter(nn.Module):
@@ -279,7 +303,7 @@ class RouteBOrbitFilter(nn.Module):
                 return self._guide(z, t, branches, eta, pre, record)
             z, volume = self.flow.transport(base, branches, eta, pre.context, num_steps=K,
                                             guidance_fn=guide if self.use_guidance else None)
-            states, log_target = chart_log_target(z, eta, branches, pre, record)
+            states, log_target = chart_log_target(z, eta, branches, pre, record, at_frame=True)
             log_q = normal_log_density(base, base.new_ones(2))-volume+normal_log_density(eta, pre.eta_std)
             if pre.lambert:
                 log_q -= math.log(2.)
@@ -287,7 +311,7 @@ class RouteBOrbitFilter(nn.Module):
             valid = torch.isfinite(log_w)
             if not bool(valid.any()):
                 return None
-            return (torch.softmax(log_w[valid], 0)[:,None] * states[valid]).sum(0)
+            return states[valid], torch.log_softmax(log_w[valid], 0)
 
         # The Gaussian OU chain preserves N(0,I_6). Terminal twisting divides that
         # known endpoint density out and includes the linear eta-scale Jacobian.
@@ -304,10 +328,14 @@ class RouteBOrbitFilter(nn.Module):
                 # below corrects its drift even when the learned direction is poor.
                 mu = torch.cat((mu[:,:2] + v/K, mu[:,2:]), dim=-1)
             return mu, std
+        terminal_states = None
         def twist(x, j):
+            nonlocal terminal_states
             eta = x[:,2:]*pre.eta_std
             if j == 0:
-                _, log_target = chart_log_target(x[:,:2], eta, branches, pre, record)
+                terminal_states, log_target = chart_log_target(
+                    x[:, :2], eta, branches, pre, record, at_frame=True
+                )
                 return (log_target + pre.eta_std.log().sum() - normal_log_density(x, x.new_ones(6))
                         + (math.log(2.) if pre.lambert else 0.))
             states, _, valid = pre.decode(x[:,:2], eta, branches, volume=False)
@@ -326,44 +354,82 @@ class RouteBOrbitFilter(nn.Module):
         live = w > 0
         if not bool(live.any()):
             return None
-        states, _, _ = pre.decode(x[live,:2], x[live,2:]*pre.eta_std, branches[live], volume=False)
-        return (w[live,None]*states).sum(0)
+        return terminal_states[live], w[live].log()
 
     @torch.inference_mode(False)
     @torch.no_grad()
     def rollout_track(self, *, initial_state_si, init_time_sec, times_sec, observed_los,
                       station_states_si, valid_mask=None, seed=20261028, **metadata):
-        from ..data.observation_clock import causal_diffusion_events
         dev = next(self.parameters()).device
         prior = torch.as_tensor(initial_state_si, dtype=torch.float64, device=dev)
-        record = dict(initial_state_si=prior, init_time_sec=init_time_sec, times_sec=times_sec,
-                      observed_los=observed_los, station_states_si=station_states_si, **metadata)
         t = torch.as_tensor(times_sec, dtype=torch.float64, device="cpu")
+        obs = torch.as_tensor(observed_los).to(prior)
+        stations = torch.as_tensor(station_states_si).to(prior)
         mask = torch.ones_like(t, dtype=torch.bool) if valid_mask is None else torch.as_tensor(valid_mask, device="cpu").bool()
-        record["valid_mask"] = mask
-        events = causal_diffusion_events(t, mask, init_time_sec, metadata.get("block_start_time_sec"),
-                                        explicit_flush=metadata.get("explicit_flush", False),
-                                        readout_until_sec=metadata.get("readout_until_sec"))
+        record = dict(
+            initial_state_si=prior,
+            init_time_sec=init_time_sec,
+            times_sec=t,
+            valid_mask=mask,
+            observed_los=obs,
+            station_states_si=stations,
+            **metadata,
+        )
+        sigmas, _ = los_noise_profile(
+            t,
+            obs,
+            metadata.get("station_ids"),
+            metadata.get("station_id_reliable"),
+            mask,
+            station_states_si=stations,
+        )
         gen = torch.Generator(device=dev).manual_seed(int(seed))
-        anchors = []
-        last, ref = -1, prior
-        ep_state = ep_time = None
-        failures = attempted = 0
-        for te, idx, endpoint in events:
-            if idx > last:
+        record["los_sigma_by_frame"] = sigmas
+        hidden = prior.new_zeros(self.encoder.context_dim)
+        particles = log_weights = None
+        priors = prior.new_zeros((len(t), 6))
+        posts = torch.zeros_like(priors)
+        attempted = failures = 0
+        for frame in observation_frames(t, mask, init_time_sec):
+            k = frame.index
+            if particles is not None:
+                particles, _ = propagate_si_with_stm(particles, frame.dt_sec, compute_stm=False)
+                prior = (log_weights.exp()[:, None] * particles).sum(0)
+            else:
+                prior, _ = propagate_si_with_stm(prior, frame.dt_sec, compute_stm=False)
+            priors[k] = prior
+            hidden = self.encoder.advance(hidden, obs[k], stations[k], frame.dt_sec)
+            # Existing particles condition on this LOS exactly once. A new proposal
+            # is importance-corrected against all received rows when support is depleted.
+            if particles is not None:
+                rays = torch.nn.functional.normalize(particles[:, :3] - stations[k, :3], dim=-1)
+                residual = rays - torch.nn.functional.normalize(obs[k], dim=0)
+                log_weights = torch.log_softmax(
+                    log_weights - residual.square().sum(-1) / (2 * sigmas[k] ** 2), dim=0
+                )
+            if (
+                particles is None
+                or len(particles) == 1
+                or 1 / log_weights.exp().square().sum() < self.num_particles / 2
+            ):
+                pre = build_chart_prefix(
+                    self.encoder,
+                    self.flow,
+                    record,
+                    k,
+                    device=dev,
+                    los_budget=self.los_budget,
+                    context=hidden,
+                    sigma=sigmas[k],
+                )
+                bank = self.sample_prefix(pre, record, gen)
                 attempted += 1
-                pre = build_chart_prefix(self.encoder, self.flow, record, idx, device=dev, los_budget=self.los_budget)
-                candidate = self.sample_prefix(pre, record, gen)
-                if candidate is not None:
-                    ref = candidate
-                else:
+                if bank is None:
                     failures += 1
-                last = idx
-            anchors.append((te, ref))
-            if endpoint:
-                ep_state, _ = propagate_si_with_stm(ref, te-init_time_sec, compute_stm=False)
-                ep_time = te
-        priors, posts = render_reference_orbits(prior, init_time_sec, t, mask, anchors)
+                else:
+                    particles, log_weights = bank
+            if particles is not None:
+                prior = (log_weights.exp()[:, None] * particles).sum(0)
+            posts[k] = prior
         return dict(prior_states_si=priors, posterior_states_si=posts,
-                    block2_t30_state_si=ep_state, block2_t30_time_sec=ep_time,
                     failed_proposals=failures, attempted_batches=attempted)

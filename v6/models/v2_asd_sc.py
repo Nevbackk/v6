@@ -1,47 +1,21 @@
-"""Model Plan V2 (ASD-SC): Adaptive Subspace Progressive Denoising & Self-Correcting Filter.
-
-Implements the complete Round 4 architecture co-designed in
-docs/MODEL_V2_ADAPTIVE_DENOISING_PLAN.md and verified in
-outputs/research_codex/ROUND4_NOISY_INIT_SELFCORRECT_REVIEW.md (b8e7855, 3ec2ba0, ae8708d):
-1. Macro-checkpoint schedule (+30s, +150s, +300s per block, <=18 steps, plus common
-   Block 2 + 30s physical readout even when held) with split Old-Window vs New-Segment pooling.
-2. Cross-gap thin-QR pending subspace transport:
-       D^{-1} Phi(t_m, t_{m-1}) D V_p = Q R,   V_p^+ = Q
-   carrying the R factor to the blind quantile head.
-3. Orthogonal-elimination conditional information unlock & restricted writeback basis E_a:
-       P_n = (A_+ V_n)(A_+ V_n)^+,   K_p = (I - P_n) A_+ V_p
-       E_a = [V_n, V_p R_rel],       E_h = V_p R_hold
-   solving SVD on A E_a = U Sigma V_a^T and mapping back via Delta_y = E_a Delta_y_red
-   so E_h^T Delta_y == 0 identically (zero leakage into held directions even under axis rotation).
-4. Subspace bounded blind denoiser (L=2 shared-weight microsteps):
-   - Sign-flip-invariant directional features F_i + near-degenerate singular subspace grouping;
-   - Blind 0.5 & 0.9 log-error quantile prediction z_hat_i;
-   - Deadzone gate chi_i, clipped ridge step c_i, bounded positive shrinkage g_i in [g_min, 1].
-5. Two-tier recovery with learned (Delta ln rho, Delta rho_dot, p_reset) re-anchoring fitted
-   on sub-arc A, causally selected on sub-arc B, and evaluated unbiasedly on sub-arc C.
-"""
+"""Per-frame subspace refinement and causal one-arrival re-anchoring."""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..data.splits import (
-    MacroCheckpoint,
-    ObservationBlock,
-    build_macro_checkpoint_schedule,
-)
-from .batched_physics import DTYPE, STATE_SCALE_VALUES, state_scale
+from ..data.observation_clock import observation_frames
+from .batched_physics import DTYPE, state_scale
 from .recursive_filter import TrainingFilterOutput
 from .reprojection import (
     ComputeLedger,
-    build_los_frame,
     estimate_online_los_noise_floor,
+    los_noise_profile,
     geodesic_angle_rad,
     propagate_si_with_stm,
     reproject_causal_window_single,
@@ -62,7 +36,7 @@ V2_ABLATION_MODES = (
 
 @dataclass
 class PendingSubspaceMemory:
-    """Latent unresolved subspace carried across 300 s gaps via thin QR."""
+    """Latent unresolved subspace carried across observation gaps via thin QR."""
 
     V_p: Tensor  # [6, p] orthonormal columns in D-scaled coordinates (0 <= p <= 6)
     r_diag_log: Tensor  # [p] log|diag(R)| from last QR transport
@@ -350,7 +324,7 @@ class SubspaceBlindDenoiserHead(nn.Module):
         s_vals = torch.einsum("wi,wk,ki->i", U, M, V_a).clamp_min(0.0)  # [k_rank]
         a_proj = U.transpose(0, 1) @ b_weighted  # [k_rank]
 
-        # Old-window vs Newly-arrived split projections (prevents dilution across 300 s gaps!)
+        # Old-window vs Newly-arrived split projections (prevents dilution across observation gaps!)
         old_mask = (~is_new_frame_2w).to(dtype=dtype).unsqueeze(-1)
         new_mask = is_new_frame_2w.to(dtype=dtype).unsqueeze(-1)
         has_old = float(old_mask.sum().item()) > 0.5
@@ -539,7 +513,7 @@ class CausalReanchorHead(nn.Module):
 
 @dataclass(frozen=True)
 class CheckpointStepOutput:
-    """Complete differentiable trace of one V2 macro-checkpoint for training and rollout."""
+    """Complete differentiable trace of one V2 observation frame for training and rollout."""
 
     prior_state_si: Tensor  # [6] x_m^-
     local_posterior_si: Tensor  # [6] x_L after L microsteps
@@ -568,7 +542,6 @@ class ASDSCFilter(nn.Module):
         s_unlock: float = 0.15,
         enable_reanchor: bool = True,
         delta_reanchor_rad2: float = 1.0e-6,
-        block_offsets_sec: Sequence[float] = (30.0, 150.0, 300.0),
         default_sigma_rad: float = 5.0e-4,
         dtype: torch.dtype = DTYPE,
     ) -> None:
@@ -580,7 +553,6 @@ class ASDSCFilter(nn.Module):
         self.s_unlock = float(s_unlock)
         self.enable_reanchor = bool(enable_reanchor)
         self.delta_reanchor_rad2 = float(delta_reanchor_rad2)
-        self.block_offsets_sec = tuple(float(x) for x in block_offsets_sec)
         self.default_sigma_rad = float(default_sigma_rad)
 
         self.denoiser = SubspaceBlindDenoiserHead(
@@ -606,14 +578,15 @@ class ASDSCFilter(nn.Module):
         prev_last_obs_idx: int,
         memory_in: PendingSubspaceMemory,
         has_new_observations: bool = True,
+        sigma_rad: float | None = None,
         station_ids: Tensor | None = None,
         station_id_reliable: Tensor | None = None,
     ) -> CheckpointStepOutput:
-        """Execute one macro-checkpoint at eval_time_sec (L=2 microsteps + pending memory update)."""
+        """Execute one observation frame at eval_time_sec (L=2 microsteps + pending memory update)."""
         device, dtype = prior_state_si.device, prior_state_si.dtype
         d_scale = state_scale(device=device, dtype=dtype)
 
-        # Exact hold when no new observations have arrived (e.g., Block 2 + 30s sparse hold)
+        # A caller without a fresh observation can only propagate.
         if (not has_new_observations) or last_obs_idx < 0:
             return CheckpointStepOutput(
                 prior_state_si=prior_state_si,
@@ -631,16 +604,19 @@ class ASDSCFilter(nn.Module):
             if valid_mask is None
             else valid_mask.detach().to("cpu", dtype=torch.bool)
         )
-        tau_k, sigma_k, _ = estimate_online_los_noise_floor(
-            t_cpu,
-            observed_los.detach().cpu(),
-            station_ids=station_ids,
-            station_id_reliable=station_id_reliable,
-            valid_mask=val_cpu,
-            up_to_idx=last_obs_idx,
-            default_sigma_rad=self.default_sigma_rad,
-            station_states_si=station_states_si.detach().cpu(),
-        )
+        if sigma_rad is None:
+            tau_k, sigma_k, _ = estimate_online_los_noise_floor(
+                t_cpu,
+                observed_los.detach().cpu(),
+                station_ids=station_ids,
+                station_id_reliable=station_id_reliable,
+                valid_mask=val_cpu,
+                up_to_idx=last_obs_idx,
+                default_sigma_rad=self.default_sigma_rad,
+                station_states_si=station_states_si.detach().cpu(),
+            )
+        else:
+            sigma_k, tau_k = sigma_rad, 3.0 * sigma_rad
         kf_idx, is_new_np = select_causal_keyframes(
             t_cpu,
             val_cpu,
@@ -648,7 +624,7 @@ class ASDSCFilter(nn.Module):
             prev_checkpoint_idx=prev_last_obs_idx,
             max_keyframes=self.max_keyframes,
         )
-        if kf_idx.size < 2:
+        if kf_idx.size == 0:
             return CheckpointStepOutput(
                 prior_state_si=prior_state_si,
                 local_posterior_si=prior_state_si,
@@ -797,7 +773,7 @@ class ASDSCFilter(nn.Module):
                     (med_ang0 / max(tau_k, 1.0e-6)).clamp_max(50.0) / 10.0,
                     torch.log(rho_l / 1.0e6),
                     rhodot_l / 1000.0,
-                    torch.tensor(rep0.window_span_sec / 600.0, device=device, dtype=dtype),
+                    torch.tensor(math.log1p(rep0.window_span_sec), device=device, dtype=dtype),
                     torch.tensor(float(mem_after_unlock.dim_p) / 6.0, device=device, dtype=dtype),
                     torch.log1p(cond_max),
                 )
@@ -822,176 +798,96 @@ class ASDSCFilter(nn.Module):
     def rollout_track(
         self,
         *,
-        initial_state_si: Tensor,
-        init_time_sec: float,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        valid_mask: Tensor | None = None,
-        iod_last_time_sec: float | None = None,
-        block_start_time_sec: float | None = None,
-        station_ids: Tensor | None = None,
-        station_id_reliable: Tensor | None = None,
-    ) -> dict[str, Any]:
-        """Run full 6-block causal self-correcting rollout (with A/B/C re-anchor & Block 2 + 30s readout)."""
-        device = next(self.parameters()).device
-        dtype = torch.float64
-        x_init = initial_state_si.to(device=device, dtype=dtype)
-        T = int(times_sec.shape[0])
-        t_cpu = times_sec.detach().to("cpu", dtype=dtype)
-        val_cpu = (
-            torch.ones((T,), dtype=torch.bool)
+        initial_state_si,
+        init_time_sec,
+        times_sec,
+        observed_los,
+        station_states_si,
+        valid_mask=None,
+        station_ids=None,
+        station_id_reliable=None,
+        return_records=False,
+    ):
+        """Freeze the current range candidate and test it on the next valid arrival."""
+        x = torch.as_tensor(initial_state_si).to(next(self.parameters()))
+        times = torch.as_tensor(times_sec).cpu().double()
+        valid = (
+            torch.ones_like(times, dtype=torch.bool)
             if valid_mask is None
-            else valid_mask.detach().to("cpu", dtype=torch.bool)
+            else torch.as_tensor(valid_mask).cpu().bool()
         )
-        obs = observed_los.to(device=device, dtype=dtype)
-        stn = station_states_si.to(device=device, dtype=dtype)
-
-        checkpoints, blocks = build_macro_checkpoint_schedule(
-            t_cpu,
-            val_cpu,
-            init_time_sec=float(init_time_sec),
-            iod_last_time_sec=iod_last_time_sec,
-            block_offsets_sec=self.block_offsets_sec,
-            include_block2_primary_endpoint=True,
-            block_start_time_sec=block_start_time_sec,
+        obs, stations = torch.as_tensor(observed_los).to(x), torch.as_tensor(station_states_si).to(x)
+        sigmas, _ = los_noise_profile(
+            times,
+            obs,
+            station_ids,
+            station_id_reliable,
+            valid,
+            station_states_si=stations,
+            default_sigma_rad=self.default_sigma_rad,
         )
-
-        # Execute macro-checkpoints along physical timeline
-        curr_x = x_init
-        curr_t = float(init_time_sec)
-        memory = PendingSubspaceMemory.empty(device, dtype)
-        cp_records: list[dict[str, Any]] = []
-        block2_t30_state: Tensor | None = None
-        block2_t30_time: float | None = None
-        reanchor_switches = 0
-        consumed_c_set: set[int] = set()
-
-        blk_by_idx = {b.block_index: b for b in blocks}
-        # Track frozen Sub-arc A candidates (block_idx -> (t_A, x_L_at_tA, x_R_at_tA, reset_logit_a))
-        pending_reanchor: dict[int, tuple[float, Tensor, Tensor, Tensor, int]] = {}
-        consumed_reanchor_blocks: set[int] = set()
-        reanchor_eligible_blocks = 0
-
-        for cp in checkpoints:
-            dt = cp.eval_time_sec - curr_t
-            if abs(dt) > 0.0:
-                curr_x, phi_step = propagate_si_with_stm(
-                    curr_x, dt, compute_stm=(memory.dim_p > 0), ledger=self.ledger
-                )
-                if memory.dim_p > 0 and phi_step is not None:
-                    memory = transport_pending_subspace_qr(memory, phi_step)
-                curr_t = cp.eval_time_sec
-
-            memory_at_entry = memory
-            out_cp = self.run_checkpoint(
-                prior_state_si=curr_x,
-                eval_time_sec=cp.eval_time_sec,
-                times_sec=t_cpu,
+        memory = PendingSubspaceMemory.empty(x.device, x.dtype)
+        priors, posts = x.new_zeros((len(times), 6)), x.new_zeros((len(times), 6))
+        pending, records = None, []
+        trials = switches = 0
+        for frame in observation_frames(times, valid, init_time_sec):
+            k, tm, dt = frame.index, frame.time_sec, frame.dt_sec
+            prior, phi = propagate_si_with_stm(x, dt, compute_stm=memory.dim_p > 0, ledger=self.ledger)
+            if phi is not None:
+                memory = transport_pending_subspace_qr(memory, phi)
+            memory_in = memory
+            out = self.run_checkpoint(
+                prior_state_si=prior,
+                eval_time_sec=tm,
+                times_sec=times,
                 observed_los=obs,
-                station_states_si=stn,
-                valid_mask=val_cpu,
-                last_obs_idx=cp.last_obs_idx,
-                prev_last_obs_idx=cp.prev_last_obs_idx,
-                memory_in=memory_at_entry,
-                has_new_observations=cp.has_new_observations,
-                station_ids=station_ids,
-                station_id_reliable=station_id_reliable,
+                station_states_si=stations,
+                valid_mask=valid,
+                last_obs_idx=k,
+                prev_last_obs_idx=frame.previous_index,
+                memory_in=memory,
+                sigma_rad=float(sigmas[k]),
             )
-            pub_x = out_cp.published_state_si
-            reanchor_applied_at_cp = False
-
-            # A is frozen at the first publication in the new block. B consists of
-            # strictly later arrivals up to the next publication. Only observations
-            # after that decision belong to C.
-            if self.enable_reanchor and cp.block_index >= 1 and cp.has_new_observations:
-                if cp.block_index in pending_reanchor:
-                    t_a, local_a, reset_a, logit_a, last_a = pending_reanchor.pop(cp.block_index)
-                    consumed_reanchor_blocks.add(cp.block_index)
-                    b_slice = slice(last_a + 1, cp.last_obs_idx + 1)
-                    b_mask = val_cpu[b_slice]
-                    if bool(b_mask.any()):
-                        reanchor_eligible_blocks += 1
-                        if logit_a.item() > 0.:
-                            bt = t_cpu[b_slice][b_mask].to(device)
-                            bs, bu = stn[b_slice][b_mask], obs[b_slice][b_mask]
-                            j_local = self._blind_arc_mse(local_a, t_a, bt, bs, bu)
-                            j_reset = self._blind_arc_mse(reset_a, t_a, bt, bs, bu)
-                            if j_local-j_reset > self.delta_reanchor_rad2:
-                                pub_x, _ = propagate_si_with_stm(reset_a, curr_t-t_a, compute_stm=False,
-                                                                ledger=self.ledger)
-                                reanchor_applied_at_cp = True
-                                reanchor_switches += 1
-                                c_end = (float(block_start_time_sec) + cp.block_index*600.+300.
-                                         if block_start_time_sec is not None else
-                                         blk_by_idx[cp.block_index].start_time_sec+300.)
-                                consumed_c_set.update(i for i in range(cp.last_obs_idx+1,T)
-                                                      if bool(val_cpu[i]) and t_cpu[i] <= c_end)
-                elif (cp.block_index not in consumed_reanchor_blocks and out_cp.reanchor_candidate_si is not None
-                      and out_cp.reset_logit is not None):
-                    pending_reanchor[cp.block_index] = (curr_t, pub_x.detach().clone(),
-                                                        out_cp.reanchor_candidate_si.detach().clone(),
-                                                        out_cp.reset_logit.detach().clone(), cp.last_obs_idx)
-
-            curr_x = pub_x
-            memory = (PendingSubspaceMemory.empty(device, dtype) if reanchor_applied_at_cp
-                      else out_cp.memory_out)
-            if cp.is_block2_primary_endpoint:
-                block2_t30_state = curr_x.clone()
-                block2_t30_time = curr_t
-
-            cp_records.append(
-                {
-                    "checkpoint": cp,
-                    "prior_state_si": out_cp.prior_state_si.detach().clone(),
-                    "published_state_si": curr_x.detach().clone(),
-                    "memory_in": memory_at_entry,
-                    "memory": memory,
-                    "reanchor_applied": reanchor_applied_at_cp,
-                }
-            )
-
-        # Render per-frame causal states along times_sec from published checkpoint piecewise trajectory
-        priors_seq: list[Tensor] = []
-        posts_seq: list[Tensor] = []
-        cp_ptr = 0
-        active_anchor_x = x_init
-        active_anchor_t = float(init_time_sec)
-
-        for k in range(T):
-            if not bool(val_cpu[k].item()):
-                priors_seq.append(torch.zeros_like(x_init))
-                posts_seq.append(torch.zeros_like(x_init))
-                continue
-            tk = float(t_cpu[k].item())
-            while cp_ptr < len(cp_records) and cp_records[cp_ptr]["checkpoint"].eval_time_sec < tk:
-                active_anchor_x = cp_records[cp_ptr]["published_state_si"]
-                active_anchor_t = cp_records[cp_ptr]["checkpoint"].eval_time_sec
-                cp_ptr += 1
-            pr_k, _ = propagate_si_with_stm(
-                active_anchor_x, tk - active_anchor_t, compute_stm=False, ledger=self.ledger
-            )
-            while cp_ptr < len(cp_records) and cp_records[cp_ptr]["checkpoint"].eval_time_sec <= tk + 1.0e-9:
-                active_anchor_x = cp_records[cp_ptr]["published_state_si"]
-                active_anchor_t = cp_records[cp_ptr]["checkpoint"].eval_time_sec
-                cp_ptr += 1
-            po_k, _ = propagate_si_with_stm(
-                active_anchor_x, tk - active_anchor_t, compute_stm=False, ledger=self.ledger
-            )
-            priors_seq.append(pr_k)
-            posts_seq.append(po_k)
-
-        return {
-            "prior_states_si": torch.stack(priors_seq, dim=0),
-            "posterior_states_si": torch.stack(posts_seq, dim=0),
-            "checkpoint_records": cp_records,
-            "block2_t30_state_si": block2_t30_state,
-            "block2_t30_time_sec": block2_t30_time,
-            "reanchor_eligible_blocks": reanchor_eligible_blocks,
-            "reanchor_switches": reanchor_switches,
-            "subarc_c_indices": sorted(list(consumed_c_set)),
-            "ledger": self.ledger.as_dict(),
-        }
+            x, memory = out.published_state_si, out.memory_out
+            switched = False
+            if pending is not None:
+                trials += 1
+                t_a, local, candidate, logit = pending
+                if float(logit) > 0:
+                    args = (t_a, times[k : k + 1], stations[k : k + 1], obs[k : k + 1])
+                    if (
+                        self._blind_arc_mse(local, *args) - self._blind_arc_mse(candidate, *args)
+                        > self.delta_reanchor_rad2
+                    ):
+                        x, _ = propagate_si_with_stm(
+                            candidate, tm - t_a, compute_stm=False, ledger=self.ledger
+                        )
+                        memory = PendingSubspaceMemory.empty(x.device, x.dtype)
+                        switched = True
+                        switches += 1
+            pending = None
+            if not switched and self.enable_reanchor and out.reanchor_candidate_si is not None:
+                pending = (tm, x, out.reanchor_candidate_si, out.reset_logit)
+            priors[k], posts[k] = prior, x
+            if return_records:
+                records.append(
+                    dict(
+                        frame=frame,
+                        prior_state_si=prior,
+                        published_state_si=x,
+                        memory_in=memory_in,
+                        memory=memory,
+                        reanchor_applied=switched,
+                    )
+                )
+        return dict(
+            prior_states_si=priors,
+            posterior_states_si=posts,
+            frame_records=records,
+            reanchor_trials=trials,
+            reanchor_switches=switches,
+            ledger=self.ledger.as_dict(),
+        )
 
     def _blind_arc_mse(
         self, state_si: Tensor, t_state_sec: float, arc_t: Tensor, arc_s: Tensor, arc_u: Tensor

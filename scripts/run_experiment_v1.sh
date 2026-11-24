@@ -13,7 +13,7 @@
 #   EPOCHS=10                      (default: 10)
 #   BATCH_SIZE=32                  (default: 32)
 #   SEEDS="20261028 20261029 20261030"
-#   STAGE=all                      (all | test | classical | abl_3x2 | ltr_lm | fd_asf | paired_val)
+#   STAGE=all                      (all | test | main | classical | abl_3x2 | ltr_lm | fd_asf | paired_val)
 #   MAX_RECORDS_PER_EPOCH=0        (0 = full TRAIN-fit; >0 = fast pilot cap, e.g. 512)
 #   MAX_EVAL_RECORDS=0             (0 = full DEV-select / VAL; >0 = fast pilot cap)
 #   RUN_PAIRED_VAL=0               (set 1 ONLY after locking model choices on dev_select!)
@@ -43,7 +43,7 @@ RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"
 
 read -r -a SEEDS_ARR <<< "${SEEDS_STR}"
 case "${STAGE}" in
-  all|test|classical|abl_3x2|ltr_lm|fd_asf|paired_val) ;;
+  all|test|main|classical|abl_3x2|ltr_lm|fd_asf|paired_val) ;;
   *) echo "Unknown stage: ${STAGE}" >&2; exit 2 ;;
 esac
 
@@ -75,6 +75,14 @@ COMMON_ARGS=(
   --max-records-per-epoch "${MAX_RECORDS_PER_EPOCH}"
   --max-eval-records "${MAX_EVAL_RECORDS}"
 )
+
+if [[ "${STAGE}" == "all" || "${STAGE}" == "main" ]]; then
+  for SEED in "${SEEDS_ARR[@]}"; do
+    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v1.py" "${COMMON_ARGS[@]}" \
+      --arch diffusion --run-dir "${RUN_DIR}" --seed "${SEED}" --epochs "${EPOCHS}" --lr "${LR}" --batch-size "${BATCH_SIZE}"
+  done
+fi
 
 # ------------------------------------------------------------------------------
 # Stage 1: Zero-Training Classical Differential Correction Controls (DEV-select)
@@ -182,6 +190,15 @@ fi
 # Stage 5 (Pre-Registered Paired Replication ONLY after locking on DEV-select)
 # ------------------------------------------------------------------------------
 if [[ "${RUN_PAIRED_VAL}" == "1" || "${STAGE}" == "paired_val" ]]; then
+  for SEED in "${SEEDS_ARR[@]}"; do
+    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    [[ -f "${RUN_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${RUN_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" "${COMMON_ARGS[@]}" \
+      --arch diffusion --run-dir "${RUN_DIR}" --resume "${RUN_DIR}/best.pt" --eval-split paired_val
+  done
+fi
+
+if [[ "${RUN_PAIRED_VAL}" == "1" && "${STAGE}" == "all" ]]; then
   echo "[V1][Stage 5] Running locked paired replication on historical VAL (10,857 records)..."
   "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" \
     "${COMMON_ARGS[@]}" \

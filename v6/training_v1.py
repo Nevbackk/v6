@@ -26,7 +26,6 @@ from .data.splits import partition_prepared_keys_by_source
 from .eval_metrics import (
     RecordEvalRow,
     compute_los_local_errors,
-    evaluate_v2_primary_endpoint_forecast300,
     summarize_record_rows,
 )
 from .models.batched_physics import state_scale
@@ -115,18 +114,19 @@ def train_v1_refiner_step_on_record(
     )
 
     rollout = model.rollout_track(
-        initial_state_si=x0, init_time_sec=t_init, times_sec=times, observed_los=obs,
-        station_states_si=stn, valid_mask=valid, block_start_time_sec=record.get("block_start_time_sec"),
-        iod_last_time_sec=record.get("iod_last_time_sec"), station_ids=record.get("station_ids"),
-        station_id_reliable=record.get("station_id_reliable"), detach_feedback=True)
-    losses = []
-    for cp, published in rollout["checkpoint_states"]:
-        k = cp.last_obs_idx
-        target, _ = propagate_si_with_stm(truth[k], cp.eval_time_sec - float(times[k]), compute_stm=False)
-        losses.append(state_regression_loss(published, target, loss_type=loss_type))
-    if not losses:
+        initial_state_si=x0,
+        init_time_sec=t_init,
+        times_sec=times,
+        observed_los=obs,
+        station_states_si=stn,
+        valid_mask=valid,
+        station_ids=record.get("station_ids"),
+        station_id_reliable=record.get("station_id_reliable"),
+        detach_feedback=True,
+    )
+    if not bool(valid.any()):
         return x0.new_zeros((), requires_grad=True)
-    return torch.stack(losses).mean()
+    return state_regression_loss(rollout["posterior_states_si"][valid], truth[valid], loss_type=loss_type)
 
 
 def train_fd_asf_proposal_step_on_record(
@@ -162,8 +162,10 @@ def evaluate_filter_records(
     dev = torch.device(device)
     model.eval()
     rows: list[RecordEvalRow] = []
+    initializations = set()
 
     for rec_id, src_id, cadence, rec in records_with_meta:
+        initializations.add(rec.get("initialization", "supplied"))
         x0 = torch.as_tensor(rec["initial_state_si"], device=dev, dtype=torch.float64)
         t0 = float(rec["init_time_sec"])
         times = torch.as_tensor(rec["times_sec"], dtype=torch.float64)
@@ -175,12 +177,18 @@ def evaluate_filter_records(
         )
 
         val_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+        if not len(val_idx):
+            raise ValueError(f"Cannot score a record without valid observations: {rec_id}")
         first_k = int(val_idx[0].item())
         last_k = int(val_idx[-1].item())
         truth_at_t0, _ = propagate_si_with_stm(
             truth[first_k], t0 - float(times[first_k].item()), compute_stm=False
         )
-        b0_err_km = float(torch.linalg.vector_norm(x0[:3] - truth_at_t0[:3]).item() / 1000.0)
+        b0_err_km = (
+            0.0
+            if rec.get("initialization") == "known_state"
+            else float(torch.linalg.vector_norm(x0[:3] - truth_at_t0[:3]).item() / 1000.0)
+        )
 
         pure_priors: list[Tensor] = []
         curr_p = x0
@@ -197,15 +205,17 @@ def evaluate_filter_records(
             / 1000.0
         )
 
-        b2_ep_km: float | None = None
+        observation_nll = None
         failed_batches = attempted_batches = 0
         if hasattr(model, "rollout_track"):
             from inspect import Parameter, signature
             parameters = signature(model.rollout_track).parameters
             accepts_kwargs = any(p.kind is Parameter.VAR_KEYWORD for p in parameters.values())
-            metadata = {key: rec[key] for key in ("station_ids", "station_id_reliable", "block_start_time_sec",
-                                                   "readout_until_sec", "iod_last_time_sec", "initial_station_si")
-                        if key in rec and (accepts_kwargs or key in parameters)}
+            metadata = {
+                key: rec[key]
+                for key in ("station_ids", "station_id_reliable", "initial_station_si")
+                if key in rec and (accepts_kwargs or key in parameters)
+            }
             roll = model.rollout_track(
                 initial_state_si=x0,
                 init_time_sec=t0,
@@ -219,16 +229,8 @@ def evaluate_filter_records(
             prior_all = roll["prior_states_si"]
             failed_batches = roll.get("failed_proposals", 0)
             attempted_batches = roll.get("attempted_batches", 0)
-            if roll["block2_t30_state_si"] is not None and roll["block2_t30_time_sec"] is not None:
-                t_ep = float(roll["block2_t30_time_sec"])
-                near_pos = int(torch.argmin((times[val_idx] - t_ep).abs()).item())
-                k_near = int(val_idx[near_pos].item())
-                truth_ep, _ = propagate_si_with_stm(
-                    truth[k_near], t_ep - float(times[k_near].item()), compute_stm=False
-                )
-                b2_ep_km = float(
-                    evaluate_v2_primary_endpoint_forecast300(roll["block2_t30_state_si"], truth_ep).item()
-                )
+            if "observation_nll" in roll:
+                observation_nll = float(roll["observation_nll"][val_idx.to(dev)].mean())
         else:
             out = model.forward_filter_sequence(
                 initial_state_si=x0,
@@ -276,12 +278,12 @@ def evaluate_filter_records(
                 pos_rmse_km=pos_rmse,
                 vel_rmse_mps=vel_rmse,
                 scaled_mse=smse,
-                block6_end_vel_rmse_mps=b6_vel if times[last_k] >= rec.get("block_start_time_sec", t0)+3000. else None,
-                block6_end_radial_pos_km=b6_rad if times[last_k] >= rec.get("block_start_time_sec", t0)+3000. else None,
+                last_frame_vel_mps=b6_vel,
+                last_frame_radial_pos_km=b6_rad,
                 is_finite=is_fin,
                 diverged=(not is_fin) or (pos_rmse > 1000.0),
                 prior_pos_rmse_km=prior_pos_rmse_km,
-                block2_t30_forecast300_pos_km=b2_ep_km,
+                observation_nll=observation_nll,
                 valid_frames=val_idx.numel(),
                 eligible_prior_epochs=int(eligible.sum()),
                 newly_harmed_epochs=int(harmful.sum()),
@@ -290,10 +292,38 @@ def evaluate_filter_records(
             )
         )
 
-    return {"summary": summarize_record_rows(rows), "rows": rows}
+    summary = summarize_record_rows(rows)
+    summary["initializations"] = sorted(initializations)
+    return {"summary": summary, "rows": rows}
+
+
+def diffusion_entry(version, evaluation):
+    """The versioned entry points default to the shared per-frame diffusion model."""
+    selector = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    selector.add_argument("--arch")
+    selector.add_argument("--ablation-mode")
+    selector.add_argument("--resume", type=Path)
+    selector.add_argument("--run-dir", type=Path)
+    chosen, _ = selector.parse_known_args()
+    arch = chosen.arch
+    if arch is None and chosen.ablation_mode is not None:
+        arch = "asd_sc"
+    if arch is None and chosen.run_dir is not None:
+        path = chosen.resume or chosen.run_dir / ("best.pt" if evaluation else "last.pt")
+        if path.exists():
+            saved = torch.load(path, map_location="cpu", weights_only=True)
+            arch = saved.get("arch", "asd_sc" if "ablation_mode" in saved else "diffusion")
+    if arch in (None, "diffusion"):
+        from .training_diffusion import main as run_diffusion
+
+        run_diffusion(evaluation, version=version)
+        return True
+    return False
 
 
 def main(evaluation: bool = False) -> None:
+    if diffusion_entry("v1", evaluation):
+        return
     parser = argparse.ArgumentParser(description="Model Plan V1 Trainer & Validator")
     parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument("--protocol-dir", type=Path, required=True)
@@ -368,7 +398,12 @@ def main(evaluation: bool = False) -> None:
 
     def _pack_eval_items(prep: Prepared, keys: Sequence[str]):
         return (
-            (k, str(prep.rows[k]["record_key"]["source_id"]), str(prep.rows[k]["record_key"]["rhythm"]), prep.record(k))
+            (
+                k,
+                str(prep.rows[k]["record_key"]["source_id"]),
+                str(prep.rows[k]["record_key"]["rhythm"]),
+                prep.record(k, exact_initial=True),
+            )
             for k in keys
         )
 
@@ -383,7 +418,7 @@ def main(evaluation: bool = False) -> None:
     fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     def selection_score(summary):
-        return float(summary["overall"]["position_km"]["p95"])
+        return float(summary["source_equal_summary"]["scaled_mse"])
     best_p95 = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -399,7 +434,7 @@ def main(evaluation: bool = False) -> None:
             optimizer.zero_grad(set_to_none=True)
             batch_losses = []
             for key in batch_keys:
-                rec = train_prep.record(key)
+                rec = train_prep.record(key, exact_initial=True)
                 if isinstance(model, FDASFSequentialFilter):
                     loss_k = train_fd_asf_proposal_step_on_record(
                         model,

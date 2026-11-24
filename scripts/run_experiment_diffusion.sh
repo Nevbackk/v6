@@ -6,7 +6,7 @@
 #   K     : artificial reverse diffusion intervals (default 4)
 #   P     : independent initial Gaussian seeds / trajectories (default 8)
 #   delta : shared floor for V_theta >= delta I and P_carry >= delta P_b^+ (default 0.10)
-#   B_los : optional cap on raw fresh-batch LOS per likelihood call (0 = full fresh batch)
+#   B_los : optional B1/B2 proposal-guidance prefix cap (terminal weights use all observations)
 #
 # Usage (Linux / AutoDL CUDA Server):
 #   PREPARED_ROOT=/path/to/prepared PROTOCOL_DIR=/path/to/protocol \
@@ -94,7 +94,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "main" ]]; then
     "${PYTHON_BIN}" "${V6_DIR}/scripts/train_diffusion.py" \
       "${COMMON_ARGS[@]}" \
       --run-dir "${RUN_DIR}" \
-      --K 4 --P 8 --delta 0.10 --B-los 0 \
+      --K 4 --P 8 --delta 0.10 \
       --guidance-mode vjp \
       --epochs "${EPOCHS}" --batch-size "${BATCH_SIZE}" --lr "${LR}" \
       --seed "${SEED}" \
@@ -114,7 +114,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "k_curve" ]]; then
     "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_diffusion.py" \
       "${COMMON_ARGS[@]}" \
       --run-dir "${OUTPUT_ROOT}/stage2_k_curve/K${K_VAL}_seed_${ABL_SEED}" \
-      --K "${K_VAL}" --P 8 --delta 0.10 --B-los 0 \
+      --K "${K_VAL}" --P 8 --delta 0.10 \
       --guidance-mode vjp \
       --resume "${MAIN_CKPT}" \
       --eval-split dev_select
@@ -134,7 +134,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl_guidance" ]]; then
     "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_diffusion.py" \
       "${COMMON_ARGS[@]}" \
       --run-dir "${OUTPUT_ROOT}/stage3_abl_guidance/${GMODE}_seed_${ABL_SEED}" \
-      --K 4 --P 8 --delta 0.10 --B-los 0 \
+      --K 4 --P 8 --delta 0.10 \
       --guidance-mode "${GMODE}" \
       --resume "${MAIN_CKPT}" \
       --eval-split dev_select
@@ -144,7 +144,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl_guidance" ]]; then
   "${PYTHON_BIN}" "${V6_DIR}/scripts/train_diffusion.py" \
     "${COMMON_ARGS[@]}" \
     --run-dir "${OUTPUT_ROOT}/stage3_abl_guidance/fixed_isotropic_v_seed_${ABL_SEED}" \
-    --K 4 --P 8 --delta 0.10 --B-los 0 \
+    --K 4 --P 8 --delta 0.10 \
     --guidance-mode vjp --fixed-isotropic-v \
     --epochs "${EPOCHS}" --batch-size "${BATCH_SIZE}" --lr "${LR}" \
     --seed "${ABL_SEED}" \
@@ -154,7 +154,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl_guidance" ]]; then
   "${PYTHON_BIN}" "${V6_DIR}/scripts/train_diffusion.py" \
     "${COMMON_ARGS[@]}" \
     --run-dir "${OUTPUT_ROOT}/stage3_abl_guidance/no_rollout_priors_seed_${ABL_SEED}" \
-    --K 4 --P 8 --delta 0.10 --B-los 0 \
+    --K 4 --P 8 --delta 0.10 \
     --guidance-mode vjp --no-rollout-priors \
     --epochs "${EPOCHS}" --batch-size "${BATCH_SIZE}" --lr "${LR}" \
     --seed "${ABL_SEED}" \
@@ -162,21 +162,11 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl_guidance" ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Stage 4: Optional Raw LOS Budget B_los & Delta Floor Sensitivity
+# Stage 4: State covariance floor sensitivity
 # ------------------------------------------------------------------------------
 if [[ "${STAGE}" == "all" || "${STAGE}" == "abl_budget_delta" ]]; then
   MAIN_CKPT="${OUTPUT_ROOT}/stage1_main_K4_P8/seed_${ABL_SEED}/best.pt"
   [[ -f "${MAIN_CKPT}" ]] || { echo "Missing required checkpoint: ${MAIN_CKPT}" >&2; exit 2; }
-  for BLOS in 16 32; do
-    echo "[Diff][Stage 4] Evaluating B_los=${BLOS} compute budget on dev_select..."
-    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_diffusion.py" \
-      "${COMMON_ARGS[@]}" \
-      --run-dir "${OUTPUT_ROOT}/stage4_budget_delta/Blos${BLOS}_seed_${ABL_SEED}" \
-      --K 4 --P 8 --delta 0.10 --B-los "${BLOS}" \
-      --guidance-mode vjp \
-      --resume "${MAIN_CKPT}" \
-      --eval-split dev_select
-  done
   for DVAL in 0.05 0.20; do
     "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_diffusion.py" "${COMMON_ARGS[@]}" \
       --run-dir "${OUTPUT_ROOT}/stage4_budget_delta/delta${DVAL}_seed_${ABL_SEED}" \

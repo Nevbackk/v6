@@ -334,12 +334,12 @@ class TestRouteACausalityAndEndToEnd(unittest.TestCase):
         )
         torch.testing.assert_close(ctx1, ctx2, atol=0.0, rtol=0.0)
 
-    def test_route_a_training_rollout_and_b_los_budget(self):
+    def test_route_a_training_and_frame_rollout(self):
         rec = _make_synthetic_two_block_record(
             pos_offset_m=(8000.0, -12000.0, 6000.0), vel_offset_mps=(-12.0, 18.0, -10.0)
         )
         model = VPOrbitDiffusionFilter(
-            num_reverse_steps=2, num_particles=4, delta=0.10, los_budget=6, guidance_mode="vjp"
+            num_reverse_steps=2, num_particles=4, delta=0.10, guidance_mode="vjp"
         )
         opt = torch.optim.Adam(model.parameters(), lr=1.0e-3)
 
@@ -371,9 +371,9 @@ class TestRouteACausalityAndEndToEnd(unittest.TestCase):
             observed_los=rec["observed_los"],
             station_states_si=rec["station_states_si"],
             valid_mask=rec["valid_mask"],
+            return_traces=True,
         )
-        self.assertGreaterEqual(len(roll["batch_traces"]), 2)
-        self.assertIsNotNone(roll["block2_t30_state_si"])
+        self.assertEqual(len(roll["batch_traces"]), len(rec["times_sec"]))
         first_tr = roll["batch_traces"][0]["trace"]
         self.assertEqual(tuple(first_tr.z_trajectory.shape), (3, 4, 6))  # [K+1, P, 6]
         self.assertEqual(tuple(first_tr.guidance_norms.shape), (2, 4))  # [K, P]
@@ -478,7 +478,7 @@ class TestRound5BaselineBugFixRegressions(unittest.TestCase):
             observed_los=rec["observed_los"],
             station_states_si=rec["station_states_si"],
         )
-        self.assertGreaterEqual(roll["reanchor_eligible_blocks"], 1)
+        self.assertGreaterEqual(roll["reanchor_trials"], 1)
 
         # 3) unconstrained_mlp6d genuinely bypasses E_a restriction
         v2_unc = ASDSCFilter(ablation_mode="unconstrained_mlp6d", num_microsteps=1)
@@ -586,6 +586,7 @@ class TestRound6SubmissionBlockerFixes(unittest.TestCase):
             observed_los=rec["observed_los"],
             station_states_si=rec["station_states_si"],
             valid_mask=rec["valid_mask"],
+            return_traces=True,
         )
         traces = res["batch_traces"]
         self.assertGreaterEqual(len(traces), 2)
@@ -599,44 +600,52 @@ class TestRound6SubmissionBlockerFixes(unittest.TestCase):
             self.assertTrue(torch.all(P_carry.diag() >= 0.10 * P_ref.diag() - 1.0e-12))
             self.assertTrue(torch.isfinite(sample_cov).all())
 
-    def test_forward_only_truncation_no_extra_posterior(self):
-        # Verifies that truncating a still-open block does not leak future event existence
-        # by publishing an extra posterior unless explicit_flush=True.
+    def test_every_arrival_is_assimilated_including_last_frame(self):
         rec = _make_synthetic_two_block_record()
-        rec_trunc = {
-            "initial_state_si": rec["initial_state_si"],
-            "init_time_sec": 0.0,
-            "times_sec": rec["times_sec"][:6],
-            "observed_los": rec["observed_los"][:6],
-            "station_states_si": rec["station_states_si"][:6],
-            "valid_mask": rec["valid_mask"][:6],
+        model = VPOrbitDiffusionFilter(num_reverse_steps=1, num_particles=2)
+        inputs = {
+            k: rec[k]
+            for k in (
+                "initial_state_si",
+                "init_time_sec",
+                "times_sec",
+                "observed_los",
+                "station_states_si",
+                "valid_mask",
+            )
         }
-        model = VPOrbitDiffusionFilter(
-            num_reverse_steps=2, num_particles=4, delta=0.10
+        inputs["valid_mask"] = inputs["valid_mask"].clone()
+        inputs["valid_mask"][4] = False
+        out = model.rollout_track(**inputs, return_traces=True)
+        actual = [r["last_obs_idx"] for r in out["batch_traces"]]
+        self.assertEqual(actual, inputs["valid_mask"].nonzero().flatten().tolist())
+        self.assertEqual(out["batch_traces"][-1]["eval_time_sec"], float(inputs["times_sec"][-1]))
+        changed = inputs["observed_los"].clone()
+        changed[-1] = torch.nn.functional.normalize(
+            changed[-1] + changed.new_tensor([0.0, 0.01, 0.0]), dim=0
         )
-        res_noflush = model.rollout_track(**rec_trunc, explicit_flush=False)
-        self.assertEqual(len(res_noflush["batch_traces"]), 0, "Still-open block without flush must not publish extra posterior")
+        perturbed = model.rollout_track(**{**inputs, "observed_los": changed})
+        torch.testing.assert_close(
+            perturbed["posterior_states_si"][:-1], out["posterior_states_si"][:-1], rtol=0, atol=0
+        )
+        self.assertGreater(
+            float((perturbed["posterior_states_si"][-1] - out["posterior_states_si"][-1]).norm()), 0.0
+        )
 
-        res_flush = model.rollout_track(**rec_trunc, explicit_flush=True)
-        self.assertEqual(len(res_flush["batch_traces"]), 1, "Explicit flush must publish accumulated batch")
-
-    def test_block2_nominal_endpoint_timing(self):
-        # Verifies Block 2 + 30s endpoint is anchored to nominal schedule epoch (init_time + 630s),
-        # not the first observed frame.
+    def test_frame_updates_are_invariant_to_time_origin(self):
         rec = _make_synthetic_two_block_record()
-        model = VPOrbitDiffusionFilter(
-            num_reverse_steps=2, num_particles=4, delta=0.10
+        model = VPOrbitDiffusionFilter(num_reverse_steps=1, num_particles=3)
+        inputs = {
+            k: rec[k]
+            for k in ("initial_state_si", "init_time_sec", "times_sec", "observed_los", "station_states_si")
+        }
+        base = model.rollout_track(**inputs)
+        shifted = model.rollout_track(
+            **{**inputs, "init_time_sec": 100.0, "times_sec": inputs["times_sec"] + 100.0}
         )
-        res = model.rollout_track(
-            initial_state_si=rec["initial_state_si"],
-            init_time_sec=100.0,
-            times_sec=rec["times_sec"] + 100.0,
-            observed_los=rec["observed_los"],
-            station_states_si=rec["station_states_si"],
-            valid_mask=rec["valid_mask"],
+        torch.testing.assert_close(
+            base["posterior_states_si"], shifted["posterior_states_si"], rtol=1.0e-8, atol=1.0e-5
         )
-        self.assertAlmostEqual(res["block2_t30_time_sec"], 730.0, places=6)
-        self.assertIsNotNone(res["block2_t30_state_si"])
 
     def test_v1_prior_protection_gate_holds_good_orbit(self):
         # Verifies V1OnlineFilter truthfully respects PriorProtectionGate on good orbit priors.
@@ -664,7 +673,6 @@ class TestRound6SubmissionBlockerFixes(unittest.TestCase):
         model = FDASFSequentialFilter()
         rec_bad = {key: value[:12] if torch.is_tensor(value) and value.ndim and len(value) == 24
                    else value for key, value in rec.items()}
-        rec_bad["readout_until_sec"] = 300.
         rec_bad["truth_states_si"] = torch.tensor([1.0e5, 0., 0., 0., 100., 0.],
                                                   dtype=torch.float64).expand(12, 6)
         rec_bad["station_states_si"] = torch.zeros_like(rec_bad["station_states_si"])

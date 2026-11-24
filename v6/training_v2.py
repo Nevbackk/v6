@@ -1,23 +1,9 @@
-"""Training, DAgger Rollout Replay, and 2-Checkpoint Unrolling for Model Plan V2 (ASD-SC).
-
-Implements the exact Round 4 training specification from
-docs/MODEL_V2_ADAPTIVE_DENOISING_PLAN.md (§2.2, §2.4) and
-outputs/research_codex/ROUND4_NOISY_INIT_SELFCORRECT_REVIEW.md (§4, commits b8e7855, 3ec2ba0, ae8708d):
-1. Counterfactual triplet prior interventions on the same LOS prefix:
-   (a) near-truth good prior, (b) observable bad prior, (c) short-arc scale-invariant fake-range prior.
-2. Multi-horizon physical forecast risk E_m(x) at {0 s, +60 s, +300 s} via pure two-body propagation.
-3. Switchable step-increment progressive supervision L_{prog,l} targeting T_l d_l on (y_{l+1} - y_l)
-   (never mixing cumulative and incremental labels!).
-4. Pinball quantile loss on blind error log-scales (0.5 and 0.9 quantiles).
-5. One-sided good-prior anti-erasure penalty with stop-gradient on the hold baseline E_m(x_m^-).
-6. Reset candidate risk + stop-gradient BCE trigger loss.
-7. On-policy DAgger rollout state buffer (with static-B0 toggle for V2-Abl-3) + 2-checkpoint
-   connected unrolling across 300 s gaps.
-"""
+"""Visited-state replay and adjacent-arrival training for the ASD-SC control."""
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -30,13 +16,10 @@ from torch import Tensor
 
 from .data.prepared import Prepared
 from .checkpoints import read_checkpoint, restore_training_state, save_epoch
-from .data.splits import (
-    MacroCheckpoint,
-    build_macro_checkpoint_schedule,
-    partition_prepared_keys_by_source,
-)
+from .data.splits import partition_prepared_keys_by_source
+from .data.observation_clock import ObservationFrame, observation_frames
 from .models.batched_physics import state_scale
-from .models.reprojection import propagate_si_with_stm
+from .models.reprojection import los_noise_profile, propagate_si_with_stm
 from .models.v2_asd_sc import (
     ASDSCFilter,
     CheckpointStepOutput,
@@ -44,7 +27,7 @@ from .models.v2_asd_sc import (
     V2_ABLATION_MODES,
     transport_pending_subspace_qr,
 )
-from .training_v1 import evaluate_filter_records
+from .training_v1 import diffusion_entry, evaluate_filter_records
 
 
 def generate_counterfactual_prior_triplet(
@@ -99,36 +82,27 @@ def _elementwise_loss(diff: Tensor, *, use_huber: bool = True, huber_delta: floa
     return diff.square().mean()
 
 
-def multi_horizon_physical_risk(
-    state_si: Tensor,
-    truth_state_m_si: Tensor,
+def frame_physical_risk(
+    state_si,
+    truth_state_si,
     *,
-    horizons_sec: Sequence[float] = (60.0, 300.0),
-    horizon_weights: Sequence[float] = (0.5, 0.5),
-    lambda_forecast: float = 1.0,
-    use_huber: bool = True,
-    huber_delta: float = 0.05,
-) -> Tensor:
-    """Compute unmodified physical multi-horizon forecast risk E_m(x) (ROUND4 §4, Eq. 89-92)."""
-    d_scale = state_scale(device=state_si.device, dtype=state_si.dtype)
-    curr_err = (state_si - truth_state_m_si) / d_scale
-    risk = _elementwise_loss(curr_err, use_huber=use_huber, huber_delta=huber_delta)
-
-    if lambda_forecast <= 0.0 or not horizons_sec:
-        return risk
-
-    f_loss = torch.zeros_like(risk)
-    for h_sec, w_h in zip(horizons_sec, horizon_weights):
-        if float(w_h) <= 0.0 or float(h_sec) <= 0.0:
-            continue
-        pred_h, _ = propagate_si_with_stm(state_si, float(h_sec), compute_stm=False)
-        with torch.no_grad():
-            truth_h, _ = propagate_si_with_stm(truth_state_m_si.detach(), float(h_sec), compute_stm=False)
-        pos_err_scaled = (pred_h[:3] - truth_h[:3]) / 1.0e6
-        f_loss = f_loss + float(w_h) * _elementwise_loss(
-            pos_err_scaled, use_huber=use_huber, huber_delta=huber_delta
+    next_dt=None,
+    next_truth=None,
+    lambda_forecast=1.0,
+    use_huber=True,
+    huber_delta=0.05,
+):
+    """Score the current six-state error and the position prediction at the next real arrival."""
+    scale = state_scale(device=state_si.device, dtype=state_si.dtype)
+    risk = _elementwise_loss(
+        (state_si - truth_state_si) / scale, use_huber=use_huber, huber_delta=huber_delta
+    )
+    if next_truth is not None and lambda_forecast > 0 and next_dt > 0:
+        pred, _ = propagate_si_with_stm(state_si, next_dt, compute_stm=False)
+        risk = risk + lambda_forecast * _elementwise_loss(
+            (pred[:3] - next_truth[:3]) / scale[:3], use_huber=use_huber, huber_delta=huber_delta
         )
-    return risk + float(lambda_forecast) * f_loss
+    return risk
 
 
 def compute_progressive_step_target(
@@ -160,8 +134,6 @@ class V2LossWeights:
     """Hyperparameters for the complete V2 checkpoint & 2-step rollout loss."""
 
     lambda_forecast: float = 1.0
-    horizons_sec: tuple[float, ...] = (60.0, 300.0)
-    horizon_weights: tuple[float, ...] = (0.5, 0.5)
     lambda_prog: float = 0.25  # set to 0.0 to ablate progressive supervision cleanly
     prog_gamma: float = 0.5
     lambda_quantile: float = 0.05
@@ -180,6 +152,9 @@ def compute_v2_checkpoint_loss(
     step_out: CheckpointStepOutput,
     truth_state_m_si: Tensor,
     weights: V2LossWeights = V2LossWeights(),
+    *,
+    next_dt=None,
+    next_truth=None,
 ) -> tuple[Tensor, dict[str, float]]:
     """Evaluate exact L_I checkpoint loss (ROUND4 §4 Eq. 100-105 + ae8708d progressive term)."""
     device, dtype = truth_state_m_si.device, truth_state_m_si.dtype
@@ -195,11 +170,11 @@ def compute_v2_checkpoint_loss(
     w_ell = 1.0 / float(L)
 
     for tr in step_out.microsteps:
-        e_m = multi_horizon_physical_risk(
+        e_m = frame_physical_risk(
             tr.state_next_si,
             truth_state_m_si,
-            horizons_sec=weights.horizons_sec,
-            horizon_weights=weights.horizon_weights,
+            next_dt=next_dt,
+            next_truth=next_truth,
             lambda_forecast=weights.lambda_forecast,
             use_huber=weights.use_huber,
             huber_delta=weights.huber_delta,
@@ -240,20 +215,20 @@ def compute_v2_checkpoint_loss(
     good_harm_loss = torch.zeros_like(total_micro)
     if is_good_prior and weights.lambda_good_harm > 0.0:
         with torch.no_grad():
-            hold_risk_sg = multi_horizon_physical_risk(
+            hold_risk_sg = frame_physical_risk(
                 step_out.prior_state_si.detach(),
                 truth_state_m_si,
-                horizons_sec=weights.horizons_sec,
-                horizon_weights=weights.horizon_weights,
+                next_dt=next_dt,
+                next_truth=next_truth,
                 lambda_forecast=weights.lambda_forecast,
                 use_huber=weights.use_huber,
                 huber_delta=weights.huber_delta,
             ).detach()
-        post_risk = multi_horizon_physical_risk(
+        post_risk = frame_physical_risk(
             step_out.local_posterior_si,
             truth_state_m_si,
-            horizons_sec=weights.horizons_sec,
-            horizon_weights=weights.horizon_weights,
+            next_dt=next_dt,
+            next_truth=next_truth,
             lambda_forecast=weights.lambda_forecast,
             use_huber=weights.use_huber,
             huber_delta=weights.huber_delta,
@@ -266,21 +241,21 @@ def compute_v2_checkpoint_loss(
         and step_out.reanchor_candidate_si is not None
         and step_out.reset_logit is not None
     ):
-        risk_R = multi_horizon_physical_risk(
+        risk_R = frame_physical_risk(
             step_out.reanchor_candidate_si,
             truth_state_m_si,
-            horizons_sec=weights.horizons_sec,
-            horizon_weights=weights.horizon_weights,
+            next_dt=next_dt,
+            next_truth=next_truth,
             lambda_forecast=weights.lambda_forecast,
             use_huber=weights.use_huber,
             huber_delta=weights.huber_delta,
         )
         with torch.no_grad():
-            risk_L_sg = multi_horizon_physical_risk(
+            risk_L_sg = frame_physical_risk(
                 step_out.local_posterior_si.detach(),
                 truth_state_m_si,
-                horizons_sec=weights.horizons_sec,
-                horizon_weights=weights.horizon_weights,
+                next_dt=next_dt,
+                next_truth=next_truth,
                 lambda_forecast=weights.lambda_forecast,
                 use_huber=weights.use_huber,
                 huber_delta=weights.huber_delta,
@@ -313,8 +288,8 @@ class RolloutPairSample:
     record_key: str
     prior_m_si: Tensor
     memory_m: PendingSubspaceMemory
-    cp_m: MacroCheckpoint
-    cp_next: MacroCheckpoint | None
+    cp_m: ObservationFrame
+    cp_next: ObservationFrame | None
     switched_state_si: Tensor | None = None
 
 
@@ -323,19 +298,24 @@ class DAggerRolloutBuffer:
 
     def __init__(self, max_pairs: int = 16384) -> None:
         self.max_pairs = int(max_pairs)
-        self.samples: list[RolloutPairSample] = []
+        self.samples = deque(maxlen=self.max_pairs)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def load_samples(self, entries):
-        self.samples = [RolloutPairSample(
-            record_key=row["record_key"], prior_m_si=row["prior_m_si"],
-            memory_m=PendingSubspaceMemory(**row["memory_m"]),
-            cp_m=MacroCheckpoint(**row["cp_m"]),
-            cp_next=None if row["cp_next"] is None else MacroCheckpoint(**row["cp_next"]),
-            switched_state_si=row.get("switched_state_si"),
-        ) for row in entries]
+        self.samples.clear()
+        self.samples.extend(
+            RolloutPairSample(
+                record_key=row["record_key"],
+                prior_m_si=row["prior_m_si"],
+                memory_m=PendingSubspaceMemory(**row["memory_m"]),
+                cp_m=ObservationFrame(**row["cp_m"]),
+                cp_next=None if row["cp_next"] is None else ObservationFrame(**row["cp_next"]),
+                switched_state_si=row.get("switched_state_si"),
+            )
+            for row in entries
+        )
 
     @torch.no_grad()
     def collect_from_records(
@@ -348,6 +328,7 @@ class DAggerRolloutBuffer:
         use_dagger_rollout: bool = True,
         counterfactual_prob: float = 0.25,
         seed: int = 20261028,
+        collected=None,
     ) -> int:
         model.eval()
         rng = random.Random(seed)
@@ -388,19 +369,17 @@ class DAggerRolloutBuffer:
                         observed_los=obs,
                         station_states_si=stn,
                         valid_mask=valid,
-                        block_start_time_sec=rec.get("block_start_time_sec"),
-                        iod_last_time_sec=rec.get("iod_last_time_sec"),
+                        return_records=True,
                         station_ids=rec.get("station_ids"),
                         station_id_reliable=rec.get("station_id_reliable"),
                     )
-                    cps = res["checkpoint_records"]
+                    cps = res["frame_records"]
                     if not cps:
                         continue
                     for i, entry in enumerate(cps):
-                        cp_m: MacroCheckpoint = entry["checkpoint"]
-                        if not cp_m.has_new_observations:
-                            continue
-                        cp_n = cps[i + 1]["checkpoint"] if (two_step_pairs and i + 1 < len(cps)) else None
+                        cp_m: ObservationFrame = entry["frame"]
+
+                        cp_n = cps[i + 1]["frame"] if (two_step_pairs and i + 1 < len(cps)) else None
                         # Use QR-transported memory_in at cp_m's exact entry epoch!
                         mem_in = entry.get("memory_in", entry["memory"])
                         mem_cpu = PendingSubspaceMemory(
@@ -419,23 +398,21 @@ class DAggerRolloutBuffer:
                                                    if entry.get("reanchor_applied", False) else None),
                             )
                         )
+                        if collected is not None:
+                            collected.append(self.samples[-1])
                         added += 1
                 else:
                     # V2-Abl-3 static B0 baseline: pure un-updated propagation without learner feedback
-                    checkpoints, _ = build_macro_checkpoint_schedule(
-                        times, valid, init_time_sec=t_init, block_offsets_sec=model.block_offsets_sec,
-                        block_start_time_sec=rec.get("block_start_time_sec"),
-                        iod_last_time_sec=rec.get("iod_last_time_sec"))
+                    checkpoints = list(observation_frames(times, valid, t_init))
                     curr_p = x0_cand
                     curr_tp = t_init
                     empty_mem = PendingSubspaceMemory.empty(torch.device("cpu"), torch.float64)
                     for i, cp_m in enumerate(checkpoints):
                         curr_p, _ = propagate_si_with_stm(
-                            curr_p, cp_m.eval_time_sec - curr_tp, compute_stm=False
+                            curr_p, cp_m.time_sec - curr_tp, compute_stm=False
                         )
-                        curr_tp = cp_m.eval_time_sec
-                        if not cp_m.has_new_observations:
-                            continue
+                        curr_tp = cp_m.time_sec
+
                         cp_n = checkpoints[i + 1] if (two_step_pairs and i + 1 < len(checkpoints)) else None
                         self.samples.append(
                             RolloutPairSample(
@@ -448,23 +425,7 @@ class DAggerRolloutBuffer:
                         )
                         added += 1
 
-        if len(self.samples) > self.max_pairs:
-            self.samples = self.samples[-self.max_pairs :]
         return added
-
-
-def _truth_at_time(
-    times_sec: Tensor, truth_states_si: Tensor, valid_mask: Tensor, target_time_sec: float
-) -> Tensor:
-    val_idx = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
-    t_val = times_sec[val_idx]
-    nearest_pos = int(torch.argmin((t_val - float(target_time_sec)).abs()).item())
-    k_near = int(val_idx[nearest_pos].item())
-    dt = float(target_time_sec) - float(times_sec[k_near].item())
-    if abs(dt) < 1.0e-9:
-        return truth_states_si[k_near]
-    x_t, _ = propagate_si_with_stm(truth_states_si[k_near], dt, compute_stm=False)
-    return x_t
 
 
 def train_two_checkpoint_pair(
@@ -495,25 +456,38 @@ def train_two_checkpoint_pair(
 
     out_1 = model.run_checkpoint(
         prior_state_si=prior_m,
-        eval_time_sec=sample.cp_m.eval_time_sec,
+        eval_time_sec=sample.cp_m.time_sec,
         times_sec=times,
         observed_los=obs,
         station_states_si=stn,
         valid_mask=valid,
-        last_obs_idx=sample.cp_m.last_obs_idx,
-        prev_last_obs_idx=sample.cp_m.prev_last_obs_idx,
+        last_obs_idx=sample.cp_m.index,
+        prev_last_obs_idx=sample.cp_m.previous_index,
         memory_in=mem_m,
-        has_new_observations=sample.cp_m.has_new_observations,
+        sigma_rad=None if "los_sigmas" not in record else record["los_sigmas"][sample.cp_m.index],
         station_ids=record.get("station_ids"),
         station_id_reliable=record.get("station_id_reliable"),
     )
-    truth_1 = _truth_at_time(times, truth, valid, sample.cp_m.eval_time_sec)
-    loss_1, stats_1 = compute_v2_checkpoint_loss(out_1, truth_1, weights=loss_weights)
 
-    if sample.cp_next is None or (not sample.cp_next.has_new_observations):
+    def frame_loss(out, frame):
+        after = torch.nonzero(valid[frame.index + 1 :], as_tuple=True)[0]
+        if not len(after):
+            return compute_v2_checkpoint_loss(out, truth[frame.index], weights=loss_weights)
+        nxt = frame.index + 1 + int(after[0])
+        return compute_v2_checkpoint_loss(
+            out,
+            truth[frame.index],
+            weights=loss_weights,
+            next_dt=float(times[nxt]) - frame.time_sec,
+            next_truth=truth[nxt],
+        )
+
+    loss_1, stats_1 = frame_loss(out_1, sample.cp_m)
+
+    if sample.cp_next is None:
         return loss_1, stats_1
 
-    dt_gap = sample.cp_next.eval_time_sec - sample.cp_m.eval_time_sec
+    dt_gap = sample.cp_next.time_sec - sample.cp_m.time_sec
     # A selected A-segment candidate is a discrete replay branch. Its published
     # B-time state differs from the new candidate proposed at B.
     pub_state_1 = (out_1.published_state_si if sample.switched_state_si is None
@@ -532,47 +506,43 @@ def train_two_checkpoint_pair(
 
     out_2 = model.run_checkpoint(
         prior_state_si=prior_2,
-        eval_time_sec=sample.cp_next.eval_time_sec,
+        eval_time_sec=sample.cp_next.time_sec,
         times_sec=times,
         observed_los=obs,
         station_states_si=stn,
         valid_mask=valid,
-        last_obs_idx=sample.cp_next.last_obs_idx,
-        prev_last_obs_idx=sample.cp_next.prev_last_obs_idx,
+        last_obs_idx=sample.cp_next.index,
+        prev_last_obs_idx=sample.cp_next.previous_index,
         memory_in=mem_2,
-        has_new_observations=sample.cp_next.has_new_observations,
+        sigma_rad=None if "los_sigmas" not in record else record["los_sigmas"][sample.cp_next.index],
+        has_new_observations=True,
         station_ids=record.get("station_ids"),
         station_id_reliable=record.get("station_id_reliable"),
     )
-    truth_2 = _truth_at_time(times, truth, valid, sample.cp_next.eval_time_sec)
-    loss_2, stats_2 = compute_v2_checkpoint_loss(out_2, truth_2, weights=loss_weights)
+    loss_2, stats_2 = frame_loss(out_2, sample.cp_next)
 
     pair_loss = 0.5 * (loss_1 + loss_2)
     merged = {k: 0.5 * (stats_1[k] + stats_2[k]) for k in stats_1}
     return pair_loss, merged
 
 
-def _parse_horizons(spec: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
-    cleaned = [float(x.strip()) for x in spec.split(",") if x.strip()]
-    if not cleaned:
-        return (), ()
-    w = tuple(1.0 / len(cleaned) for _ in cleaned)
-    return tuple(cleaned), w
-
-
 def main(evaluation: bool = False) -> None:
+    if diffusion_entry("v2", evaluation):
+        return
     parser = argparse.ArgumentParser(description="Model Plan V2 (ASD-SC) Trainer & Validator")
     parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument("--protocol-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--arch", choices=("asd_sc",), default="asd_sc")
     parser.add_argument("--ablation-mode", default="full", choices=V2_ABLATION_MODES)
     parser.add_argument("--disable-reanchor", action="store_true", help="V2-Abl-5: disable Tier-2 re-anchor")
     parser.add_argument("--single-step-grad", action="store_true", help="V2-Abl-3: 1-checkpoint vs 2-checkpoint unroll")
     parser.add_argument("--no-dagger-replay", action="store_true", help="V2-Abl-3: static B0 only vs DAgger replay")
     parser.add_argument("--counterfactual-prob", type=float, default=0.25, help="Paired good/bad/fake-range prior prob")
-    parser.add_argument("--horizons-sec", default="60,300", help="Comma-separated forecast horizons (e.g. '60,300' or '60')")
     parser.add_argument("--lambda-prog", type=float, default=0.25, help="Progressive step-increment weight (0 disables)")
-    parser.add_argument("--lambda-forecast", type=float, default=1.0, help="V2-Abl-4: multi-horizon forecast weight")
+    parser.add_argument(
+        "--lambda-forecast", type=float, default=1.0, help="V2-Abl-4: next-observation forecast weight"
+    )
     parser.add_argument("--lambda-good-harm", type=float, default=2.0, help="One-sided good-prior anti-erasure weight")
     parser.add_argument("--eval-split", default="dev_select", choices=("dev_select", "paired_val"))
     parser.add_argument("--max-records-per-epoch", type=int, default=0, help="0 = full train_fit split")
@@ -589,9 +559,19 @@ def main(evaluation: bool = False) -> None:
     if not evaluation and args.eval_split == "paired_val":
         parser.error("Training/model selection MUST use --eval-split dev_select; reserve paired_val for locked validation only.")
 
-    config_keys = ("ablation_mode", "disable_reanchor", "single_step_grad", "no_dagger_replay",
-                   "counterfactual_prob", "horizons_sec", "lambda_prog", "lambda_forecast",
-                   "lambda_good_harm", "seed", "split_seed")
+    config_keys = (
+        "arch",
+        "ablation_mode",
+        "disable_reanchor",
+        "single_step_grad",
+        "no_dagger_replay",
+        "counterfactual_prob",
+        "lambda_prog",
+        "lambda_forecast",
+        "lambda_good_harm",
+        "seed",
+        "split_seed",
+    )
     ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -632,21 +612,16 @@ def main(evaluation: bool = False) -> None:
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
     fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
-    h_vals, h_weights = _parse_horizons(args.horizons_sec)
     loss_weights = V2LossWeights(
-        horizons_sec=h_vals,
-        horizon_weights=h_weights,
         lambda_prog=args.lambda_prog,
-        lambda_forecast=args.lambda_forecast if h_vals else 0.0,
+        lambda_forecast=args.lambda_forecast,
         lambda_quantile=0.0 if args.ablation_mode == "no_quantile_aux" else 0.05,
         lambda_good_harm=args.lambda_good_harm,
     )
     buffer = DAggerRolloutBuffer(max_pairs=32768)
     buffer.load_samples(ckpt.get("replay", []))
     def selection_score(summary):
-        overall = summary["overall"]
-        return float(overall.get("v2_primary_block2_t30_forecast300_pos_km",
-                                 overall["position_km"])["capped_mean"])
+        return summary["source_equal_summary"]["scaled_mse"]
     best_ep = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -659,30 +634,46 @@ def main(evaluation: bool = False) -> None:
             else shuffled_fit
         )
 
-        # Stream rollout collection & optimization in manageable chunks so RAM stays bounded on 35k records
-        chunk_size = 512
-        for c_start in range(0, len(active_keys), chunk_size):
-            c_keys = active_keys[c_start : c_start + chunk_size]
-            rec_cache = {k: train_prep.record(k) for k in c_keys}
+        def training_record(key):
+            rec = train_prep.record(key)
+            rec["los_sigmas"], _ = los_noise_profile(
+                rec["times_sec"],
+                rec["observed_los"],
+                rec.get("station_ids"),
+                rec.get("station_id_reliable"),
+                rec.get("valid_mask"),
+                station_states_si=rec["station_states_si"],
+            )
+            return rec
+
+        for cursor, key in enumerate(active_keys):
+            rec_cache = {key: training_record(key)}
+            # Optimize every newly visited frame before eviction from bounded replay.
+            recent_pool = (
+                rng.sample(list(buffer.samples), min(len(buffer), args.batch_size))
+                if not args.no_dagger_replay
+                else []
+            )
             buffer.collect_from_records(
                 model,
                 rec_cache,
-                c_keys,
-                two_step_pairs=(not args.single_step_grad),
-                use_dagger_rollout=(not args.no_dagger_replay),
+                [key],
+                two_step_pairs=not args.single_step_grad,
+                use_dagger_rollout=not args.no_dagger_replay,
                 counterfactual_prob=args.counterfactual_prob,
-                seed=args.seed + epoch + c_start,
+                seed=args.seed + epoch + cursor,
+                collected=recent_pool,
             )
-
             model.train()
-            recent_pool = list(buffer.samples[-min(len(buffer), chunk_size * 8) :])
             rng.shuffle(recent_pool)
             for start in range(0, len(recent_pool), args.batch_size):
                 batch_samples = recent_pool[start : start + args.batch_size]
                 optimizer.zero_grad(set_to_none=True)
                 losses = []
                 for smp in batch_samples:
-                    rec_obj = rec_cache.get(smp.record_key) or train_prep.record(smp.record_key)
+                    if smp.record_key not in rec_cache:
+                        rec_cache[smp.record_key] = training_record(smp.record_key)
+                    rec_obj = rec_cache[smp.record_key]
                     lp, _ = train_two_checkpoint_pair(
                         model,
                         smp,
@@ -701,7 +692,7 @@ def main(evaluation: bool = False) -> None:
                     json.dumps(
                         {
                             "epoch": epoch,
-                            "chunk_start": c_start,
+                            "record_index": cursor,
                             "pair_cursor": start + len(batch_samples),
                             "train_loss": float(loss.detach().item()),
                             "grad_norm": float(grad_norm.item()),
@@ -725,7 +716,7 @@ __all__ = [
     "compute_v2_checkpoint_loss",
     "generate_counterfactual_prior_triplet",
     "main",
-    "multi_horizon_physical_risk",
+    "frame_physical_risk",
     "pinball_loss",
     "train_two_checkpoint_pair",
 ]

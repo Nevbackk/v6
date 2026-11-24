@@ -9,11 +9,10 @@ import numpy as np
 import torch
 
 from v6.data.batch_collate import collate_filter_sequences
-from v6.data.splits import build_macro_checkpoint_schedule, partition_prepared_keys_by_source
+from v6.data.splits import partition_prepared_keys_by_source
 from v6.eval_metrics import (
     cluster_paired_bootstrap_ci,
     directional_benefit_metrics,
-    evaluate_v2_primary_endpoint_forecast300,
     measure_secant_amplification,
 )
 from v6.models.batched_physics import state_scale
@@ -420,7 +419,7 @@ class TestModelPlanV2ASDSC(unittest.TestCase):
         torch.testing.assert_close(u_t, u_f, atol=1.0e-14, rtol=1.0e-14)
         torch.testing.assert_close(udot_t, udot_f, atol=1.0e-14, rtol=1.0e-14)
 
-    def test_v2_deadzone_hold_dagger_two_step_unroll_and_primary_endpoint(self):
+    def test_v2_deadzone_hold_dagger_two_frame_unroll(self):
         # 1) Exact deadzone hold on noiseless good prior
         rec_clean = _make_synthetic_two_block_record(pos_offset_m=(0.0, 0.0, 0.0), vel_offset_mps=(0.0, 0.0, 0.0))
         v2 = ASDSCFilter(ablation_mode="full", num_microsteps=2)
@@ -434,12 +433,7 @@ class TestModelPlanV2ASDSC(unittest.TestCase):
         torch.testing.assert_close(
             roll_clean["posterior_states_si"], rec_clean["truth_states_si"], atol=1.0e-7, rtol=1.0e-7
         )
-        self.assertIsNotNone(roll_clean["block2_t30_state_si"])
-        ep_err = evaluate_v2_primary_endpoint_forecast300(
-            roll_clean["block2_t30_state_si"],
-            propagate_si_with_stm(rec_clean["initial_state_si"], roll_clean["block2_t30_time_sec"], compute_stm=False)[0],
-        )
-        self.assertLess(ep_err.item(), 1.0e-6)
+        self.assertEqual(len(roll_clean["posterior_states_si"]), len(rec_clean["times_sec"]))
 
         # 2) DAgger rollout buffer + 2-checkpoint cross-gap connected unrolling + Adam step
         rec_noisy = _make_synthetic_two_block_record(
@@ -448,7 +442,7 @@ class TestModelPlanV2ASDSC(unittest.TestCase):
         buf = DAggerRolloutBuffer()
         added = buf.collect_from_records(v2, {"rec_0": rec_noisy}, ["rec_0"], two_step_pairs=True)
         self.assertGreaterEqual(added, 4)
-        cross_gap_samples = [s for s in buf.samples if s.cp_next is not None and s.cp_next.crossed_gap]
+        cross_gap_samples = [s for s in buf.samples if s.cp_next is not None and s.cp_next.dt_sec > 100.0]
         self.assertGreaterEqual(len(cross_gap_samples), 1)
 
         v2.train()

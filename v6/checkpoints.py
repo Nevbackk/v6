@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import random
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,6 +16,12 @@ def read_checkpoint(args, parser, *, evaluation, config_keys, eval_overrides=(),
             parser.error(f"Checkpoint does not exist: {filename}")
         return {}
     ckpt = torch.load(filename, map_location="cpu", weights_only=True)
+    if ckpt.get("recursion") != "valid_frame":
+        parser.error(
+            "This checkpoint predates the per-frame model and selection metric; use a new run directory"
+        )
+    if hasattr(args, "version") and ckpt.get("version") != args.version:
+        parser.error(f"Expected a {args.version} checkpoint for this initialization protocol")
     saved = ckpt.get("config", ckpt)
     explicit = {token.partition("=")[0] for token in sys.argv[1:]}
     for action in parser._actions:
@@ -64,8 +69,17 @@ def save_epoch(path, last_path, model, optimizer, args, config_keys, epoch, scor
            "torch": torch.get_rng_state(),
            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else []}
     config = {key: getattr(args, key) for key in config_keys}
-    payload = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "epoch": epoch,
-               "best_score": min(score, best_score), "config": config, "rng": rng, **config, **extra}
+    payload = {
+        "recursion": "valid_frame",
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_score": min(score, best_score),
+        "config": config,
+        "rng": rng,
+        **config,
+        **extra,
+    }
     destinations = [path]
     if score < best_score or not (path.parent / "best.pt").is_file():
         destinations.append(path.parent / "best.pt")

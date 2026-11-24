@@ -9,13 +9,11 @@ import sys
 import tempfile
 import unittest
 
-import numpy as np
 import torch
 
 from tests.test_v1_v2_models import _make_synthetic_two_block_record
-from v6.data.observation_clock import causal_diffusion_events
+from v6.data.observation_clock import observation_frames
 from v6.data.splits import assign_source_split
-from v6.models.diffusion_orbit import RouteBGuidedCosineFlow2D
 from v6.models.orbit_proposals import RouteBOrbitFilter, build_chart_prefix
 from v6.training_diffusion import train_route_b_cosine_flow_step_on_record
 from v6.models.diffusion_orbit import VPOrbitDiffusionFilter, compute_noisy_los_guidance_o6
@@ -55,13 +53,36 @@ def make_prepared(root):
                 # Distinct calibrated source errors.
                 x0[0] += i*250.
                 keys.append(key)
-                init.append(dict(cache_key=key, record_key=meta, shard_id=0,
-                                 shared_initialization=True, initial_epoch_sec=0., dense_t_init=0.,
-                                 initial_state=x0, B0=x0, initial_observation_index=-1,
-                                 filter_observation_count=len(fixture["times_sec"])))
-                raw.append(dict(**meta, block_start_time_sec=0., t=fixture["times_sec"],
-                                los=fixture["observed_los"], sat_state=fixture["station_states_si"],
-                                tgt_state=fixture["truth_states_si"], sat_id=fixture["station_ids"]))
+                init.append(
+                    dict(
+                        cache_key=key,
+                        record_key=meta,
+                        shard_id=0,
+                        shared_initialization=True,
+                        initial_epoch_sec=0.0,
+                        dense_t_init=0.0,
+                        initial_state=x0,
+                        B0=x0,
+                        initial_observation_index=0,
+                        filter_observation_count=len(fixture["times_sec"]),
+                    )
+                )
+
+                def with_initial(row, value):
+                    return torch.cat((row.new_tensor(value).reshape((1,) + row.shape[1:]), row))
+
+                target0 = [7.8e6, 2.5e5, 1.2e5, -200.0, 7100.0, 1400.0]
+                station0 = [6.878e6, 0.0, 0.0, 0.0, 7612.0, 1000.0]
+                raw.append(
+                    dict(
+                        **meta,
+                        t=with_initial(fixture["times_sec"], 0.0),
+                        los=with_initial(fixture["observed_los"], [1.0, 0.0, 0.0]),
+                        sat_state=with_initial(fixture["station_states_si"], station0),
+                        tgt_state=with_initial(fixture["truth_states_si"], target0),
+                        sat_id=with_initial(fixture["station_ids"], 0),
+                    )
+                )
         config["source_filter"][split] = dict(allowlist_path=allow.name,
                                                allowlist_sha256=hashlib.sha256(allow.read_bytes()).hexdigest())
         config[f"fixed_{split}_record_keys"] = keys
@@ -103,13 +124,20 @@ class TestSubmissionPaths(unittest.TestCase):
 
     def test_published_prefix_is_invariant_at_a_future_gap(self):
         rec = _make_synthetic_two_block_record()
-        for model in (VPOrbitDiffusionFilter(num_reverse_steps=1, num_particles=2, los_budget=2),
-                      RouteBOrbitFilter("b1", num_steps=1, num_particles=2, los_budget=2),
-                      RouteBOrbitFilter("b2", num_steps=1, num_particles=2, los_budget=2)):
+        for model in (
+            VPOrbitDiffusionFilter(num_reverse_steps=1, num_particles=2),
+            RouteBOrbitFilter("b1", num_steps=1, num_particles=2, los_budget=2),
+            RouteBOrbitFilter("b2", num_steps=1, num_particles=2, los_budget=2),
+        ):
             def rollout(n):
-                return model.rollout_track(initial_state_si=rec["initial_state_si"], init_time_sec=0.,
-                    times_sec=rec["times_sec"][:n], observed_los=rec["observed_los"][:n],
-                    station_states_si=rec["station_states_si"][:n], block_start_time_sec=0., seed=11)
+                return model.rollout_track(
+                    initial_state_si=rec["initial_state_si"],
+                    init_time_sec=0.0,
+                    times_sec=rec["times_sec"][:n],
+                    observed_los=rec["observed_los"][:n],
+                    station_states_si=rec["station_states_si"][:n],
+                    seed=11,
+                )
             full = rollout(24)
             for n in (12, 20):
                 sliced = rollout(n)
@@ -119,18 +147,20 @@ class TestSubmissionPaths(unittest.TestCase):
     def test_replay_uses_the_accepted_state_and_clears_local_memory(self):
         from unittest.mock import patch
         rec = _make_synthetic_two_block_record()
-        model = ASDSCFilter(num_microsteps=1, block_offsets_sec=(30., 90., 150.))
+        model = ASDSCFilter(num_microsteps=1)
         buffer = DAggerRolloutBuffer()
         def candidate(state, station, features):
             return state + 1.e3, state.new_tensor(2.)
-        with patch.object(model.reanchor_head, "propose_reanchor", side_effect=candidate), \
-             patch.object(model, "_blind_arc_mse", side_effect=[1., 0.]):
+        with patch.object(model.reanchor_head, "propose_reanchor", side_effect=candidate), patch.object(
+            model, "_blind_arc_mse", side_effect=[1.0, 0.0] + [0.0] * 100
+        ):
             buffer.collect_from_records(model, {"track":rec}, ["track"], counterfactual_prob=0.)
         switched = [x for x in buffer.samples if x.switched_state_si is not None]
         self.assertEqual(len(switched), 1)
         sample = switched[0]
-        expected, _ = propagate_si_with_stm(sample.switched_state_si,
-                      sample.cp_next.eval_time_sec-sample.cp_m.eval_time_sec, compute_stm=False)
+        expected, _ = propagate_si_with_stm(
+            sample.switched_state_si, sample.cp_next.time_sec - sample.cp_m.time_sec, compute_stm=False
+        )
         with patch.object(model, "run_checkpoint", wraps=model.run_checkpoint) as traced:
             loss, _ = train_two_checkpoint_pair(model, sample, rec)
             loss.backward()
@@ -138,14 +168,13 @@ class TestSubmissionPaths(unittest.TestCase):
         torch.testing.assert_close(second["prior_state_si"], expected, atol=0, rtol=0)
         self.assertEqual(second["memory_in"].dim_p, 0)
 
-    def test_clock_is_independent_of_future_and_missing_exposures(self):
-        t = torch.tensor([10.,50.,300.,670.,898.])
-        clock = causal_diffusion_events(t, None, 10., 0.)
-        self.assertEqual(clock, [(300.,2,False),(630.,2,True)])
-        self.assertEqual(causal_diffusion_events(t[:2], None, 10., 0.), [])
-        self.assertEqual(causal_diffusion_events(t[:3], None, 10., 0.), clock[:1])
-        held = causal_diffusion_events(t[:3], None, 10., 0., readout_until_sec=630.)
-        self.assertEqual(held, clock)
+    def test_frame_clock_uses_only_valid_timestamps(self):
+        t = torch.tensor([10.0, float("nan"), 19.0, 658.0, 661.0])
+        valid = torch.tensor([True, False, True, True, True])
+        frames = list(observation_frames(t, valid, 7.0))
+        self.assertEqual([f.index for f in frames], [0, 2, 3, 4])
+        self.assertEqual([f.dt_sec for f in frames], [3.0, 9.0, 639.0, 3.0])
+        self.assertEqual(frames[:2], list(observation_frames(t[:3], valid[:3], 7.0)))
 
     def test_both_teacher_charts_and_nondefault_candidate_count(self):
         from unittest.mock import patch
@@ -156,7 +185,7 @@ class TestSubmissionPaths(unittest.TestCase):
         for block in (0,1):
             torch.manual_seed(22)
             flow.zero_grad()
-            with patch("v6.training_diffusion.random.choice", side_effect=lambda blocks: blocks[block]):
+            with patch("v6.training_diffusion.random.choice", return_value=(11, 23)[block]):
                 loss = train_route_b_cosine_flow_step_on_record(flow.flow, flow.encoder, rec, num_ref_candidates=31)
             loss.backward()
             self.assertGreater(float(flow.flow.chart_embedding.weight.grad[block].norm()), 0.)
@@ -169,10 +198,32 @@ class TestSubmissionPaths(unittest.TestCase):
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS":"1", "MKL_NUM_THREADS":"1"}
             for route in ("a","b1","b2"):
                 out = root/route
-                common = ["--prepared-root",str(root),"--protocol-dir",str(proto),
-                          "--run-dir",str(out),"--device","cpu","--route",route,
-                          "--K","1","--P","2","--B-los","2","--batch-size","1",
-                          "--max-records-per-epoch","1","--max-eval-records","1","--seed","11"]
+                common = [
+                    "--prepared-root",
+                    str(root),
+                    "--protocol-dir",
+                    str(proto),
+                    "--run-dir",
+                    str(out),
+                    "--device",
+                    "cpu",
+                    "--route",
+                    route,
+                    "--K",
+                    "1",
+                    "--P",
+                    "2",
+                    "--B-los",
+                    ("0" if route == "a" else "2"),
+                    "--batch-size",
+                    "1",
+                    "--max-records-per-epoch",
+                    "1",
+                    "--max-eval-records",
+                    "1",
+                    "--seed",
+                    "11",
+                ]
                 def call(script, more):
                     return subprocess.run([sys.executable,"-s",str(v6_root/"scripts"/script),*common,*more],
                                           cwd=v6_root, env=env, capture_output=True, text=True)
@@ -185,7 +236,8 @@ class TestSubmissionPaths(unittest.TestCase):
                 self.assertEqual(val.returncode, 0, val.stderr)
                 summary = json.loads((out/"eval_diff_paired_val.json").read_text())
                 self.assertEqual(summary["overall"]["count"], 1)
-                self.assertIn("v2_primary_block2_t30_forecast300_pos_km", summary["overall"])
+                self.assertEqual(summary["overall"]["valid_frames"], 24)
+                self.assertIn("scaled_mse", summary["source_equal_summary"])
                 if route != "a":
                     self.assertGreater(summary["overall"]["attempted_proposal_batches"], 0)
                 else:

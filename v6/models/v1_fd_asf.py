@@ -28,11 +28,10 @@ import math
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..data.splits import parse_observation_blocks
+from ..data.observation_clock import observation_frames
 from .batched_physics import DTYPE, MU_EARTH_M3_S2, state_scale
 from .normalization import EARTH_RADIUS_M, T_SCALE_S, V_SCALE_MPS
 from .recursive_filter import TrainingFilterOutput
@@ -40,6 +39,7 @@ from .reprojection import (
     ComputeLedger,
     build_los_frame,
     geodesic_angle_rad,
+    los_noise_profile,
     propagate_si_with_stm,
     safe_sinc,
     spherical_exp_map,
@@ -417,26 +417,32 @@ class LambertChart2Plus4:
 
 
 class ContinuousTrackletEncoder(nn.Module):
-    """Pillar I: Cadence-invariant continuous-time additive normal-statistics encoder.
+    """Recurrent summary of the LOS and measured observer ephemeris at each arrival."""
 
-    Computes H_s = sum_{j in s} phi(tau_j) phi(tau_j)^T in R^{4x4} and
-    B_s = sum_{j in s} phi(tau_j) y_j^T in R^{4x2} on Legendre basis up to degree 3,
-    eliminating sequence-length discrepancies across dense / stride5 / stride20 / pois10.
-    """
-
-    def __init__(self, context_dim: int = 48, max_blocks: int = 6, dtype: torch.dtype = DTYPE) -> None:
+    def __init__(self, context_dim: int = 48, dtype: torch.dtype = DTYPE) -> None:
         super().__init__()
         self.context_dim = int(context_dim)
-        self.max_blocks = int(max_blocks)
-        # Per-block summary dim: 10 (upper tri of H_s / N) + 8 (B_s / N) + 8 (LS fit u_dot + u_bar + stn + span + sigma) = 26
-        self.block_feat_dim = 26
-        self.block_mlp = nn.Sequential(
-            nn.Linear(self.block_feat_dim, context_dim, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(context_dim, context_dim, dtype=dtype),
-            nn.LayerNorm(context_dim, dtype=dtype),
+        self.frame_cell = nn.GRUCell(10, context_dim, dtype=dtype)
+
+    def advance(self, hidden, los, station, dt_sec):
+        features = torch.cat(
+            (
+                nn.functional.normalize(los, dim=-1),
+                station[:3] / EARTH_RADIUS_M,
+                station[3:] / V_SCALE_MPS,
+                los.new_tensor([math.log1p(dt_sec / T_SCALE_S)]),
+            )
         )
-        self.gru = nn.GRU(context_dim, context_dim, batch_first=True, dtype=dtype)
+        return self.frame_cell(features.to(self.frame_cell.weight_ih), hidden)
+
+    def frame_contexts(self, times, obs, stations, valid, init_time_sec):
+        hidden = self.frame_cell.weight_ih.new_zeros(self.context_dim)
+        contexts = []
+        for frame in observation_frames(times, valid, init_time_sec):
+            k = frame.index
+            hidden = self.advance(hidden, obs[k], stations[k], frame.dt_sec)
+            contexts.append(hidden)
+        return contexts
 
     @staticmethod
     def legendre_basis(tau: Tensor) -> Tensor:
@@ -476,89 +482,24 @@ class ContinuousTrackletEncoder(nn.Module):
 
     def encode_prefix(
         self,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        valid_mask: Tensor | None,
+        times_sec,
+        observed_los,
+        station_states_si,
+        valid_mask,
         *,
-        up_to_idx: int,
-        sigma_u_rad: float = 5.0e-4,
-    ) -> tuple[Tensor, dict[str, Any]]:
-        """Encode causal prefix <= up_to_idx into fixed context vector [context_dim] + Attributable summary."""
-        p_dtype = self.block_mlp[0].weight.dtype
-        device = self.block_mlp[0].weight.device
-        t_np = np.asarray(times_sec.detach().cpu(), dtype=np.float64).reshape(-1)[: up_to_idx + 1]
-        v_np = (
-            np.ones_like(t_np, dtype=bool)
-            if valid_mask is None
-            else np.asarray(valid_mask.detach().cpu(), dtype=bool).reshape(-1)[: up_to_idx + 1]
+        up_to_idx,
+        init_time_sec=0.0,
+        sigma_u_rad=None,
+    ):
+        end = up_to_idx + 1
+        rows = self.frame_contexts(
+            times_sec[:end],
+            observed_los[:end],
+            station_states_si[:end],
+            valid_mask[:end] if valid_mask is not None else None,
+            init_time_sec,
         )
-        blocks = parse_observation_blocks(t_np, v_np)
-        if not blocks:
-            return torch.zeros((self.context_dim,), device=device, dtype=p_dtype), {}
-
-        blk_feats: list[Tensor] = []
-        last_attr: dict[str, Any] = {}
-        t0_global = blocks[0].start_time_sec
-
-        for blk in blocks[-self.max_blocks :]:
-            sl = slice(blk.start_idx, blk.end_idx + 1)
-            m_b = torch.as_tensor(v_np[sl], device=device, dtype=torch.bool)
-            t_b = times_sec[sl].to(device=device, dtype=torch.float64)[m_b]
-            u_b = observed_los[sl].to(device=device, dtype=torch.float64)[m_b]
-            s_b = station_states_si[sl].to(device=device, dtype=torch.float64)[m_b]
-
-            t_c = 0.5 * (blk.start_time_sec + blk.end_time_sec)
-            half_span = max(0.5 * (blk.end_time_sec - blk.start_time_sec), 15.0)
-            u_mean = u_b.mean(dim=0)
-            u_bar = u_mean / torch.linalg.vector_norm(u_mean).clamp_min(1.0e-15)
-            H_s, B_s, count = self.compute_additive_block_stats(
-                t_b, u_b, t_center_sec=t_c, half_span_sec=half_span, u_bar_ref=u_bar
-            )
-            n_safe = float(max(count, 1))
-            H_norm = H_s / n_safe
-            B_norm = B_s / n_safe
-
-            # Adaptive order truncation based on frame count & SVD condition number
-            order = min(4, max(1, count))
-            H_sub = H_norm[:order, :order] + 1.0e-4 * torch.eye(order, device=device, dtype=torch.float64)
-            coeff = torch.linalg.solve(H_sub, B_norm[:order])  # [order, 2]
-            omega_est = (coeff[1] / half_span) if order >= 2 else torch.zeros((2,), device=device, dtype=torch.float64)
-
-            triu_idx = torch.triu_indices(4, 4, device=device)
-            h_vec = H_norm[triu_idx[0], triu_idx[1]]  # [10]
-            b_vec = B_norm.reshape(8) / max(sigma_u_rad, 1.0e-4)  # [8]
-            s_center = s_b[count // 2]
-            meta_vec = torch.cat(
-                (
-                    u_bar,
-                    omega_est * float(T_SCALE_S),
-                    torch.tensor(
-                        [
-                            (t_c - t0_global) / float(T_SCALE_S),
-                            half_span / float(T_SCALE_S),
-                            math.log10(max(sigma_u_rad, 1.0e-7)),
-                        ],
-                        device=device,
-                        dtype=torch.float64,
-                    ),
-                ),
-                dim=0,
-            )  # [8]
-            blk_feats.append(torch.cat((h_vec, b_vec.clamp(-50.0, 50.0), meta_vec), dim=0).to(dtype=p_dtype))
-            last_attr = {
-                "t_c_sec": t_c,
-                "station_c_si": s_center,
-                "u_bar_c": u_bar,
-                "omega_bar_c": omega_est,
-                "first_block_t_sec": blocks[0].start_time_sec,
-                "first_station_si": station_states_si[blocks[0].start_idx].to(device=device, dtype=torch.float64),
-                "first_u_bar": observed_los[blocks[0].start_idx].to(device=device, dtype=torch.float64),
-            }
-
-        seq = self.block_mlp(torch.stack(blk_feats, dim=0)).unsqueeze(0)  # [1, B_k, D]
-        _, h_last = self.gru(seq)
-        return h_last.squeeze(0).squeeze(0), last_attr
+        return (rows[-1] if rows else self.frame_cell.weight_ih.new_zeros(self.context_dim)), {}
 
 
 class ConditionalRealNVP2D(nn.Module):
@@ -952,13 +893,19 @@ class FDASFSequentialFilter(nn.Module):
 
     @torch.no_grad()
     def rollout_track(
-        self, *, initial_state_si, init_time_sec, times_sec, observed_los, station_states_si,
-        valid_mask=None, block_start_time_sec=None, station_ids=None, station_id_reliable=None,
-        explicit_flush=False, readout_until_sec=None,
+        self,
+        *,
+        initial_state_si,
+        init_time_sec,
+        times_sec,
+        observed_los,
+        station_states_si,
+        valid_mask=None,
+        station_ids=None,
+        station_id_reliable=None,
     ) -> dict[str, Any]:
-        """Refresh or reweight reference-epoch particles at scheduled physical readouts."""
-        from ..data.observation_clock import causal_diffusion_events
-        from .orbit_proposals import build_chart_prefix, normal_log_density, prefix_nll, render_reference_orbits
+        """Refresh or reweight reference-epoch particles at each arriving observation."""
+        from .orbit_proposals import build_chart_prefix, normal_log_density, prefix_nll
 
         device = next(self.parameters()).device
         initial = initial_state_si.to(device=device, dtype=torch.float64)
@@ -969,73 +916,111 @@ class FDASFSequentialFilter(nn.Module):
         record = dict(initial_state_si=initial, init_time_sec=init_time_sec, times_sec=times,
                       observed_los=obs, station_states_si=stations, valid_mask=valid,
                       station_ids=station_ids, station_id_reliable=station_id_reliable)
-        events = causal_diffusion_events(times, valid, init_time_sec, block_start_time_sec,
-                                        explicit_flush=explicit_flush, readout_until_sec=readout_until_sec)
-        anchors = []
-        particles = log_base = weights = None
-        endpoint = endpoint_time = None
-        previous, switches, attempted, failures = -1, 0, 0, 0
-        for at, k, is_endpoint in events:
-            if k > previous:
-                previous = k
-                pre = build_chart_prefix(self.tracklet_encoder, None, record, k, device=device, los_budget=16)
-                if weights is None or 1.0 / weights.square().sum() < self.num_particles / 2:
-                    attempted += 1
-                    z, branch, log_q = self.proposal.sample_and_log_prob(
-                        pre.context, self.num_particles, mode=self.proposal_mode)
-                    eta = torch.randn((len(z), 4), dtype=z.dtype, device=device) * pre.eta_std
-                    states, ld, in_chart = pre.decode(z, eta, branch, volume=True)
-                    proposal_base = ld - log_q - normal_log_density(eta, pre.eta_std)
-                    supported = in_chart & check_bound_perigee_feasible(states) & torch.isfinite(proposal_base)
-                    if bool(supported.any()):
-                        particles, log_base = states[supported], proposal_base[supported]
-                    else:
-                        failures += 1
-                if particles is not None:
-                    # Both refreshed and retained particles see the same prefix and noise calibration.
-                    log_w = log_base - prefix_nll(particles, pre, record)
+        sigmas, _ = los_noise_profile(
+            times, obs, station_ids, station_id_reliable, valid, station_states_si=stations
+        )
+        record["los_sigma_by_frame"] = sigmas
+        hidden = initial.new_zeros(self.tracklet_encoder.context_dim)
+        current = initial
+        priors, posts = initial.new_zeros((len(times), 6)), initial.new_zeros((len(times), 6))
+        particles = propagated = log_weights = weights = None
+        switches = attempted = failures = 0
+        for frame in observation_frames(times, valid, init_time_sec):
+            k, at = frame.index, frame.time_sec
+            current, _ = propagate_si_with_stm(current, frame.dt_sec, compute_stm=False)
+            priors[k] = current
+            hidden = self.tracklet_encoder.advance(hidden, obs[k], stations[k], frame.dt_sec)
+            pre = build_chart_prefix(
+                self.tracklet_encoder,
+                None,
+                record,
+                k,
+                device=device,
+                los_budget=16,
+                context=hidden,
+                sigma=sigmas[k],
+            )
+            if propagated is not None:
+                propagated, _ = propagate_si_with_stm(propagated, frame.dt_sec, compute_stm=False)
+                rays = nn.functional.normalize(propagated[:, :3] - stations[k, :3], dim=-1)
+                error = rays - nn.functional.normalize(obs[k], dim=0)
+                log_weights = torch.log_softmax(
+                    log_weights - error.square().sum(-1) / (2 * pre.sigma**2), dim=0
+                )
+                weights = log_weights.exp()
+            if weights is None or len(weights) == 1 or 1 / weights.square().sum() < self.num_particles / 2:
+                attempted += 1
+                z, branch, log_q = self.proposal.sample_and_log_prob(
+                    pre.context, self.num_particles, mode=self.proposal_mode
+                )
+                eta = torch.randn((len(z), 4), dtype=z.dtype, device=device) * pre.eta_std
+                states, ld, in_chart = pre.decode(z, eta, branch, volume=True)
+                log_base = ld - log_q - normal_log_density(eta, pre.eta_std)
+                supported = in_chart & check_bound_perigee_feasible(states) & torch.isfinite(log_base)
+                refreshed = False
+                if bool(supported.any()):
+                    cost, endpoints = prefix_nll(
+                        states[supported], pre, record, all_observations=True, return_states=True
+                    )
+                    log_w = log_base[supported] - cost
                     finite = torch.isfinite(log_w)
                     if bool(finite.any()):
-                        particles, log_base = particles[finite], log_base[finite]
-                        weights = torch.softmax(log_w[finite], dim=0)
-                        idx = pre.indices
-                        if len(idx) >= 2:
-                            kf_t, kf_s, kf_u = times[idx].to(initial), stations[idx], obs[idx]
-                            top = weights.topk(min(self.top_k_polish, len(weights))).indices
-                            modes = []
-                            pos = stations[k, :3] + (at-float(times[k])) * stations[k, 3:]
-                            for candidate in particles[top]:
-                                state, _ = propagate_si_with_stm(candidate, at-init_time_sec, compute_stm=False)
-                                for _ in range(self.lm_polish_steps):
-                                    result = self.lm_refiner.refine_anchor(
-                                        state, at, pos, kf_t, kf_s, kf_u, tau_rad=3*pre.sigma, ledger=self.ledger)
-                                    state = result.posterior_state_si
-                                state_ref, _ = propagate_si_with_stm(state, init_time_sec-at, compute_stm=False)
-                                if bool(check_bound_perigee_feasible(state_ref.unsqueeze(0))[0]):
-                                    modes.append(state_ref)
-                            if modes:
-                                modes = torch.stack(modes)
-                                angles = []
-                                for t, station, los in zip(kf_t, kf_s, kf_u):
-                                    state, _ = propagate_si_with_stm(published, float(t)-init_time_sec, compute_stm=False)
-                                    angles.append(geodesic_angle_rad(state[:3]-station[:3], los))
-                                decision = self.publisher.select_published_orbit(
-                                    prior_theta_ref_si=published, prior_median_angle_rad=float(torch.stack(angles).median()),
-                                    tau_rad=3*pre.sigma, prior_nll=float(prefix_nll(published[None], pre, record)[0]),
-                                    polished_modes_theta_ref_si=modes, polished_modes_nll=prefix_nll(modes, pre, record),
-                                    particle_thetas_ref_si=particles, particle_weights=weights)
-                                published = decision.published_theta_ref_si
-                                switches += int(decision.switched_from_prior)
-                    else:
-                        particles = log_base = weights = None
-                anchors.append((at, published))
-            if is_endpoint:
-                endpoint, _ = propagate_si_with_stm(published, at-init_time_sec, compute_stm=False)
-                endpoint_time = at
-        priors, posts = render_reference_orbits(initial, init_time_sec, times, valid, anchors)
-        return dict(prior_states_si=priors, posterior_states_si=posts, switches=switches,
-                    ledger=self.ledger.as_dict(), failed_proposals=failures, attempted_batches=attempted,
-                    block2_t30_state_si=endpoint, block2_t30_time_sec=endpoint_time)
+                        particles = states[supported][finite]
+                        propagated = endpoints[finite]
+                        log_weights = torch.log_softmax(log_w[finite], dim=0)
+                        weights = log_weights.exp()
+                        refreshed = True
+                failures += int(not refreshed)
+            if weights is not None:
+                idx = pre.indices
+                if len(idx) >= 2:
+                    kf_t, kf_s, kf_u = times[idx].to(initial), stations[idx], obs[idx]
+                    top = weights.topk(min(self.top_k_polish, len(weights))).indices
+                    modes = []
+                    pos = stations[k, :3] + (at - float(times[k])) * stations[k, 3:]
+                    for candidate in particles[top]:
+                        state, _ = propagate_si_with_stm(candidate, at - init_time_sec, compute_stm=False)
+                        for _ in range(self.lm_polish_steps):
+                            result = self.lm_refiner.refine_anchor(
+                                state, at, pos, kf_t, kf_s, kf_u, tau_rad=3 * pre.sigma, ledger=self.ledger
+                            )
+                            state = result.posterior_state_si
+                        state_ref, _ = propagate_si_with_stm(state, init_time_sec - at, compute_stm=False)
+                        if bool(check_bound_perigee_feasible(state_ref.unsqueeze(0))[0]):
+                            modes.append(state_ref)
+                    if modes:
+                        modes = torch.stack(modes)
+                        angles = []
+                        for t, station, los in zip(kf_t, kf_s, kf_u):
+                            state, _ = propagate_si_with_stm(
+                                published, float(t) - init_time_sec, compute_stm=False
+                            )
+                            angles.append(geodesic_angle_rad(state[:3] - station[:3], los))
+                        decision = self.publisher.select_published_orbit(
+                            prior_theta_ref_si=published,
+                            prior_median_angle_rad=float(torch.stack(angles).median()),
+                            tau_rad=3 * pre.sigma,
+                            prior_nll=float(prefix_nll(published[None], pre, record)[0]),
+                            polished_modes_theta_ref_si=modes,
+                            polished_modes_nll=prefix_nll(modes, pre, record),
+                            particle_thetas_ref_si=particles,
+                            particle_weights=weights,
+                        )
+                        published = decision.published_theta_ref_si
+                        if decision.switched_from_prior:
+                            current, _ = propagate_si_with_stm(
+                                published, at - init_time_sec, compute_stm=False
+                            )
+                            switches += 1
+            posts[k] = current
+        return dict(
+            prior_states_si=priors,
+            posterior_states_si=posts,
+            switches=switches,
+            ledger=self.ledger.as_dict(),
+            failed_proposals=failures,
+            attempted_batches=attempted,
+        )
 
     def forward_single_track(self, **kwargs) -> tuple[Tensor, Tensor, dict[str, Any]]:
         result = self.rollout_track(**kwargs)

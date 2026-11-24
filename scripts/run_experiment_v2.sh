@@ -9,9 +9,9 @@
 #   - Stage 2 (V2-Abl-1): Prior + LOS Synergy (obs_only vs state_only vs no_cf vs full)
 #   - Stage 3 (V2-Abl-2): Blind Scale Trust Gate (fixed_g vs unconstrained_mlp6d vs no_quantile_aux)
 #   - Stage 4 (V2-Abl-3): 2x2 {Static B0, DAgger Replay} x {1-Step Grad, 2-Step Unroll}
-#   - Stage 5 (V2-Abl-4): Multi-Horizon {0s, +60s, +300s} & Progressive Step-Increment T_l d_l
+#   - Stage 5 (V2-Abl-4): Next observed frame & Progressive Step-Increment T_l d_l
 #   - Stage 6 (V2-Abl-5): Cross-Gap QR Pending Memory V_p/K_p/E_a & Tier-2 A/B/C Re-anchoring
-#   - Stage 7: Locked Paired Replication on historical VAL (Block 2 +30s -> +300s endpoint)
+#   - Stage 7: Locked Paired Replication on historical VAL (all valid frames)
 #
 # Usage (Linux / AutoDL CUDA Server):
 #   PREPARED_ROOT=/path/to/prepared PROTOCOL_DIR=/path/to/protocol \
@@ -42,7 +42,7 @@ RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"
 
 read -r -a SEEDS_ARR <<< "${SEEDS_STR}"
 case "${STAGE}" in
-  all|test|main|abl1_synergy|abl2_gate|abl3_replay_unroll|abl4_horizon_prog|abl5_memory_reanchor|paired_val) ;;
+  all|test|main|asd_sc|abl1_synergy|abl2_gate|abl3_replay_unroll|abl4_horizon_prog|abl5_memory_reanchor|paired_val) ;;
   *) echo "Unknown stage: ${STAGE}" >&2; exit 2 ;;
 esac
 ABL_SEED="${ABL_SEED:-${SEEDS_ARR[0]}}"
@@ -79,10 +79,20 @@ COMMON_ARGS=(
   --max-eval-records "${MAX_EVAL_RECORDS}"
 )
 
-# ------------------------------------------------------------------------------
-# Stage 1: Full ASD-SC Main Model (3 Pre-Registered Seeds)
-# ------------------------------------------------------------------------------
 if [[ "${STAGE}" == "all" || "${STAGE}" == "main" ]]; then
+  for SEED in "${SEEDS_ARR[@]}"; do
+    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    INIT_ARGS=()
+    if [[ -n "${SENSOR_CHECKPOINT:-}" && ! -f "${RUN_DIR}/last.pt" ]]; then INIT_ARGS=(--sensor-checkpoint "${SENSOR_CHECKPOINT}"); fi
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v2.py" "${COMMON_ARGS[@]}" \
+      --arch diffusion --run-dir "${RUN_DIR}" --seed "${SEED}" "${INIT_ARGS[@]}"
+  done
+fi
+
+# ------------------------------------------------------------------------------
+# Stage 1: ASD-SC control (3 Pre-Registered Seeds)
+# ------------------------------------------------------------------------------
+if [[ "${STAGE}" == "all" || "${STAGE}" == "asd_sc" ]]; then
   for SEED in "${SEEDS_ARR[@]}"; do
     RUN_DIR="${OUTPUT_ROOT}/stage1_asd_sc_full/seed_${SEED}"
     echo "[V2][Stage 1] Training Full ASD-SC | seed=${SEED}..."
@@ -90,7 +100,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "main" ]]; then
       "${COMMON_ARGS[@]}" \
       --run-dir "${RUN_DIR}" \
       --ablation-mode full \
-      --horizons-sec "60,300" \
+
       --lambda-forecast 1.0 \
       --lambda-prog 0.25 \
       --lambda-good-harm 2.0 \
@@ -142,11 +152,11 @@ fi
 # ------------------------------------------------------------------------------
 # Stage 4 (V2-Abl-3): 2x2 DAgger Visited-State Replay x Unroll Gradient Length
 #    Note: (DAgger + 2-Step) is already trained in Stage 1 (seed=${ABL_SEED});
-#   the static-B0 + 1-Step cell is the primary comparator for the Block 2 +30s endpoint!
+#   the static-B0 + 1-Step cell is the primary comparator for the per-frame comparison!
 # ------------------------------------------------------------------------------
 if [[ "${STAGE}" == "all" || "${STAGE}" == "abl3_replay_unroll" ]]; then
   for SEED in "${SEEDS_ARR[@]}"; do
-    echo "[V2][Abl-3] Training Static-B0 + 1-Step comparator (for Block 2 +30s paired endpoint) | seed=${SEED}..."
+    echo "[V2][Abl-3] Training Static-B0 + 1-Step comparator (for per-frame comparison) | seed=${SEED}..."
     "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v2.py" \
       "${COMMON_ARGS[@]}" \
       --run-dir "${OUTPUT_ROOT}/abl3_replay_unroll/static_1step/seed_${SEED}" \
@@ -185,17 +195,17 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl4_horizon_prog" ]]; then
     "${COMMON_ARGS[@]}" \
     --run-dir "${OUTPUT_ROOT}/abl4_horizon_prog/current_only_seed_${ABL_SEED}" \
     --ablation-mode full \
-    --horizons-sec "" \
+
     --lambda-forecast 0.0 \
     --seed "${ABL_SEED}" \
     --eval-split dev_select
 
-  echo "[V2][Abl-4] Training Current + 60s Only | seed=${ABL_SEED}..."
+  echo "[V2][Abl-4] Training Current + next valid frame | seed=${ABL_SEED}..."
   "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v2.py" \
     "${COMMON_ARGS[@]}" \
-    --run-dir "${OUTPUT_ROOT}/abl4_horizon_prog/horizon_60s_only_seed_${ABL_SEED}" \
+    --run-dir "${OUTPUT_ROOT}/abl4_horizon_prog/next_frame_seed_${ABL_SEED}" \
     --ablation-mode full \
-    --horizons-sec "60" \
+
     --lambda-forecast 1.0 \
     --seed "${ABL_SEED}" \
     --eval-split dev_select
@@ -243,9 +253,18 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl5_memory_reanchor" ]]; then
 fi
 
 # ------------------------------------------------------------------------------
-# Stage 7: Locked Paired Replication on Historical VAL (Block 2 +30s -> +300s Endpoint)
+# Stage 7: Locked Paired Replication on Historical VAL (per-frame states)
 # ------------------------------------------------------------------------------
 if [[ "${RUN_PAIRED_VAL}" == "1" || "${STAGE}" == "paired_val" ]]; then
+  for SEED in "${SEEDS_ARR[@]}"; do
+    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    [[ -f "${RUN_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${RUN_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" "${COMMON_ARGS[@]}" \
+      --arch diffusion --run-dir "${RUN_DIR}" --resume "${RUN_DIR}/best.pt" --eval-split paired_val
+  done
+fi
+
+if [[ "${RUN_PAIRED_VAL}" == "1" && "${STAGE}" == "all" ]]; then
   echo "[V2][Stage 7] Evaluating locked ASD-SC vs Static-1Step on historical VAL..."
   for SEED in "${SEEDS_ARR[@]}"; do
     FULL_DIR="${OUTPUT_ROOT}/stage1_asd_sc_full/seed_${SEED}"

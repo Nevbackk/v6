@@ -18,10 +18,11 @@ param(
     [int[]]$Seeds = @(20261028, 20261029, 20261030),
     [int]$AblSeed = $Seeds[0],
     [int]$SplitSeed = $(if ($env:SPLIT_SEED) { [int]$env:SPLIT_SEED } else { 20261028 }),
-    [ValidateSet("all", "test", "main", "abl1_synergy", "abl2_gate", "abl3_replay_unroll", "abl4_horizon_prog", "abl5_memory_reanchor", "paired_val")]
+    [ValidateSet("all", "test", "main", "asd_sc", "abl1_synergy", "abl2_gate", "abl3_replay_unroll", "abl4_horizon_prog", "abl5_memory_reanchor", "paired_val")]
     [string]$Stage = "all",
     [int]$MaxRecordsPerEpoch = 0,
     [int]$MaxEvalRecords = 0,
+    [string]$SensorCheckpoint = $env:SENSOR_CHECKPOINT,
     [switch]$RunPairedVal
 )
 
@@ -67,10 +68,19 @@ $CommonArgs = @(
 
 if ($Stage -in @("all", "main")) {
     foreach ($seed in $Seeds) {
+        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        $initArgs = @()
+        if ($SensorCheckpoint -and -not (Test-Path (Join-Path $runDir "last.pt"))) { $initArgs = @("--sensor-checkpoint", $SensorCheckpoint) }
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs --arch diffusion --run-dir $runDir --seed $seed @initArgs
+    }
+}
+
+if ($Stage -in @("all", "asd_sc")) {
+    foreach ($seed in $Seeds) {
         $runDir = "$OutputRoot\stage1_asd_sc_full\seed_$seed"
         Write-Host "[V2][Stage 1] Training Full ASD-SC | seed=$seed..."
         Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
-            --run-dir $runDir --ablation-mode full --horizons-sec "60,300" `
+            --run-dir $runDir --ablation-mode full `
             --lambda-forecast 1.0 --lambda-prog 0.25 --lambda-good-harm 2.0 `
             --counterfactual-prob 0.25 --seed "$seed" --eval-split dev_select
     }
@@ -112,10 +122,10 @@ if ($Stage -in @("all", "abl3_replay_unroll")) {
 if ($Stage -in @("all", "abl4_horizon_prog")) {
     Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\current_only_seed_$AblSeed" `
-        --ablation-mode full --horizons-sec= --lambda-forecast 0.0 --seed "$AblSeed" --eval-split dev_select
+        --ablation-mode full --lambda-forecast 0.0 --seed "$AblSeed" --eval-split dev_select
     Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
-        --run-dir "$OutputRoot\abl4_horizon_prog\horizon_60s_only_seed_$AblSeed" `
-        --ablation-mode full --horizons-sec "60" --lambda-forecast 1.0 --seed "$AblSeed" --eval-split dev_select
+        --run-dir "$OutputRoot\abl4_horizon_prog\next_frame_seed_$AblSeed" `
+        --ablation-mode full --lambda-forecast 1.0 --seed "$AblSeed" --eval-split dev_select
     Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\no_progressive_aux_seed_$AblSeed" `
         --ablation-mode full --lambda-prog 0.0 --seed "$AblSeed" --eval-split dev_select
@@ -134,6 +144,14 @@ if ($Stage -in @("all", "abl5_memory_reanchor")) {
 }
 
 if ($RunPairedVal -or ($Stage -eq "paired_val")) {
+    foreach ($seed in $Seeds) {
+        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        $best = Join-Path $runDir "best.pt"
+        if (-not (Test-Path -LiteralPath $best -PathType Leaf)) { throw "Missing required checkpoint: $best" }
+        Invoke-ExperimentPython "$V6Dir\scripts\validate_v2.py" @CommonArgs --arch diffusion --run-dir $runDir --resume $best --eval-split paired_val
+    }
+}
+if ($RunPairedVal -and ($Stage -eq "all")) {
     Write-Host "[V2][Stage 7] Evaluating locked ASD-SC vs Static-1Step on historical VAL..."
     foreach ($seed in $Seeds) {
         $fullBest = "$OutputRoot\stage1_asd_sc_full\seed_$seed\best.pt"

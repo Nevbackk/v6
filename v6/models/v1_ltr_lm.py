@@ -24,14 +24,13 @@ docs/JOINT_RESEARCH_PLAN.md (§2.1–§2.5):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..data.splits import build_macro_checkpoint_schedule
-from .batched_physics import DTYPE, MAX_SUBSTEP_SEC, STATE_SCALE_VALUES, state_scale
+from ..data.observation_clock import observation_frames
+from .batched_physics import DTYPE, state_scale
 from .normalization import EARTH_RADIUS_M, T_SCALE_S
 from .recursive_filter import TrainingFilterOutput
 from .reprojection import (
@@ -39,7 +38,7 @@ from .reprojection import (
     WindowReprojectionResult,
     apply_local_msc_step,
     deadzone_gate_alpha,
-    estimate_online_los_noise_floor,
+    los_noise_profile,
     geodesic_angle_rad,
     propagate_si_with_stm,
     reproject_causal_window_single,
@@ -767,7 +766,6 @@ class V1OnlineFilter(nn.Module):
         *,
         base_filter: nn.Module | None = None,
         max_keyframes: int | None = None,
-        trigger_offsets_sec: Sequence[float] = (30.0, 150.0, 300.0),
         prior_gate: PriorProtectionGate | None = None,
         default_sigma_rad: float = 5.0e-4,
         c_tau: float = 3.0,
@@ -780,7 +778,6 @@ class V1OnlineFilter(nn.Module):
             if max_keyframes is None
             else int(max_keyframes)
         )
-        self.trigger_offsets_sec = tuple(float(x) for x in trigger_offsets_sec)
         self.prior_gate = prior_gate or PriorProtectionGate()
         self.default_sigma_rad = float(default_sigma_rad)
         self.c_tau = float(c_tau)
@@ -790,78 +787,72 @@ class V1OnlineFilter(nn.Module):
         self, *, initial_state_si: Tensor, init_time_sec: float, times_sec: Tensor,
         observed_los: Tensor, station_states_si: Tensor, station_ids: Tensor | None = None,
         station_id_reliable: Tensor | None = None, valid_mask: Tensor | None = None,
-        iod_last_time_sec: float | None = None, block_start_time_sec: float | None = None,
         detach_feedback: bool = False,
     ) -> dict[str, Any]:
-        """Apply backbone updates at arrivals and history corrections at their publication times."""
+        """Propagate the last posterior and refine the causal prefix at each valid arrival."""
         x0 = initial_state_si.to(torch.float64)
         times = times_sec.detach().cpu().double()
         valid = torch.ones_like(times, dtype=torch.bool) if valid_mask is None else valid_mask.detach().cpu().bool()
         obs, stations = observed_los.to(x0), station_states_si.to(x0)
-        obs_cpu, stations_cpu = obs.detach().cpu(), stations.detach().cpu()
-        indices = valid.nonzero().flatten().tolist()
-        first_time = float(times[indices[0]]) if indices else float(init_time_sec)
-        checkpoints, _ = build_macro_checkpoint_schedule(
-            times, valid, init_time_sec=init_time_sec, iod_last_time_sec=iod_last_time_sec,
-            block_offsets_sec=self.trigger_offsets_sec, block_start_time_sec=block_start_time_sec)
-        at_frame = {float(times[k]): k for k in indices}
-        at_checkpoint = {cp.eval_time_sec: cp for cp in checkpoints}
-        anchor, anchor_time = x0, float(init_time_sec)
+        sigmas, _ = los_noise_profile(
+            times,
+            obs,
+            station_ids,
+            station_id_reliable,
+            valid,
+            default_sigma_rad=self.default_sigma_rad,
+            station_states_si=stations,
+        )
+        anchor = x0
         priors = [torch.zeros_like(x0)] * len(times)
         posts = priors.copy()
-        publications = []
         accepted = 0
-        endpoint, endpoint_time = None, None
         base_step = getattr(self.base_filter, "step", None)
         base_propagate = getattr(self.base_filter, "propagate", None)
         if self.base_filter is not None and not callable(base_step) and not callable(base_propagate):
             raise TypeError("base_filter must provide step(previous_state, dt, los, station) or propagate(state, dt)")
-
-        def noise_floor(k):
-            return estimate_online_los_noise_floor(
-                times, obs_cpu, station_ids, station_id_reliable, valid, up_to_idx=k,
-                c_tau=self.c_tau, default_sigma_rad=self.default_sigma_rad, station_states_si=stations_cpu)[0]
-
-        for tm in sorted(at_frame.keys() | at_checkpoint.keys()):
-            dt = tm - anchor_time
+        first_time = None
+        for frame in observation_frames(times, valid, init_time_sec):
+            k, tm, dt = frame.index, frame.time_sec, frame.dt_sec
+            if first_time is None:
+                first_time = tm
             if callable(base_propagate):
                 prior = base_propagate(anchor, dt)
             else:
                 prior, _ = propagate_si_with_stm(anchor, dt, compute_stm=False, ledger=self.ledger)
             post = prior
-            k = at_frame.get(tm)
-            cp = at_checkpoint.get(tm)
-            tau = None
-            if k is not None and callable(base_step):
-                tau = noise_floor(k)
+            tau = self.c_tau * sigmas[k]
+            if callable(base_step):
                 angle = float(geodesic_angle_rad(prior[:3] - stations[k, :3], obs[k]).detach())
                 if not self.prior_gate.should_hold_prior(tm - first_time, angle, tau):
                     post = base_step(anchor, dt, obs[k], stations[k])
-            if cp is not None:
-                last = cp.last_obs_idx
-                if cp.has_new_observations:
-                    idx, _ = select_causal_keyframes(
-                        times, valid, up_to_idx=last, prev_checkpoint_idx=cp.prev_last_obs_idx,
-                        max_keyframes=self.max_keyframes)
-                    if len(idx) >= 2:
-                        tau = noise_floor(last) if tau is None else tau
-                        # Station ephemeris at the publication time using the latest measured velocity.
-                        pos = stations[last, :3] + (tm - float(times[last])) * stations[last, 3:]
-                        step = self.refiner.refine_anchor(post, tm, pos, times[idx].to(x0),
-                                                          stations[idx], obs[idx], tau_rad=tau, ledger=self.ledger)
-                        post = step.posterior_state_si
-                        accepted += int(step.accepted)
-                    publications.append((cp, post))
-                if cp.is_block2_primary_endpoint:
-                    endpoint, endpoint_time = post, tm
-            if k is not None:
-                priors[k], posts[k] = prior, post
-            if cp is not None or callable(base_step):
-                anchor = post.detach() if detach_feedback else post
-                anchor_time = tm
-        return dict(prior_states_si=torch.stack(priors), posterior_states_si=torch.stack(posts),
-                    checkpoint_states=publications, accepted_triggers=accepted, ledger=self.ledger.as_dict(),
-                    block2_t30_state_si=endpoint, block2_t30_time_sec=endpoint_time)
+            idx, _ = select_causal_keyframes(
+                times,
+                valid,
+                up_to_idx=k,
+                prev_checkpoint_idx=frame.previous_index,
+                max_keyframes=self.max_keyframes,
+            )
+            step = self.refiner.refine_anchor(
+                post,
+                tm,
+                stations[k, :3],
+                times[idx].to(x0),
+                stations[idx],
+                obs[idx],
+                tau_rad=tau,
+                ledger=self.ledger,
+            )
+            post = step.posterior_state_si
+            accepted += int(step.accepted)
+            priors[k], posts[k] = prior, post
+            anchor = post.detach() if detach_feedback else post
+        return dict(
+            prior_states_si=torch.stack(priors),
+            posterior_states_si=torch.stack(posts),
+            accepted_triggers=accepted,
+            ledger=self.ledger.as_dict(),
+        )
 
     def forward_single_track(self, **kwargs) -> tuple[Tensor, Tensor, dict[str, Any]]:
         result = self.rollout_track(**kwargs)

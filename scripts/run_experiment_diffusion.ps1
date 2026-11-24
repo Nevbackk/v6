@@ -67,7 +67,7 @@ if ($Stage -in @("all", "main")) {
         $runDir = "$OutputRoot\stage1_main_K4_P8\seed_$seed"
         Write-Host "[Diff][Stage 1] Training VP-OrbitDiff (K=4, P=8, delta=0.10, VJP) | seed=$seed..."
         Invoke-ExperimentPython "$V6Dir\scripts\train_diffusion.py" @CommonArgs `
-            --run-dir $runDir --K 4 --P 8 --delta 0.10 --B-los 0 --guidance-mode vjp `
+            --run-dir $runDir --K 4 --P 8 --delta 0.10 --guidance-mode vjp `
             --epochs "$Epochs" --batch-size "$BatchSize" --lr "$Lr" --seed "$seed" --eval-split dev_select
     }
 }
@@ -79,7 +79,7 @@ if ($Stage -in @("all", "k_curve")) {
         Write-Host "[Diff][Stage 2] Evaluating trained VP-OrbitDiff at K=$kVal on dev_select..."
         Invoke-ExperimentPython "$V6Dir\scripts\validate_diffusion.py" @CommonArgs `
             --run-dir "$OutputRoot\stage2_k_curve\K${kVal}_seed_$AblSeed" `
-            --K "$kVal" --P 8 --delta 0.10 --B-los 0 --guidance-mode vjp `
+            --K "$kVal" --P 8 --delta 0.10 --guidance-mode vjp `
             --resume $mainCkpt --eval-split dev_select
     }
 }
@@ -90,28 +90,22 @@ if ($Stage -in @("all", "abl_guidance")) {
     foreach ($gMode in @("identity_jac", "none")) {
         Invoke-ExperimentPython "$V6Dir\scripts\validate_diffusion.py" @CommonArgs `
             --run-dir "$OutputRoot\stage3_abl_guidance\${gMode}_seed_$AblSeed" `
-            --K 4 --P 8 --delta 0.10 --B-los 0 --guidance-mode $gMode `
+            --K 4 --P 8 --delta 0.10 --guidance-mode $gMode `
             --resume $mainCkpt --eval-split dev_select
     }
     Invoke-ExperimentPython "$V6Dir\scripts\train_diffusion.py" @CommonArgs `
         --run-dir "$OutputRoot\stage3_abl_guidance\fixed_isotropic_v_seed_$AblSeed" `
-        --K 4 --P 8 --delta 0.10 --B-los 0 --guidance-mode vjp --fixed-isotropic-v `
+        --K 4 --P 8 --delta 0.10 --guidance-mode vjp --fixed-isotropic-v `
         --epochs "$Epochs" --batch-size "$BatchSize" --lr "$Lr" --seed "$AblSeed" --eval-split dev_select
     Invoke-ExperimentPython "$V6Dir\scripts\train_diffusion.py" @CommonArgs `
         --run-dir "$OutputRoot\stage3_abl_guidance\no_rollout_priors_seed_$AblSeed" `
-        --K 4 --P 8 --delta 0.10 --B-los 0 --guidance-mode vjp --no-rollout-priors `
+        --K 4 --P 8 --delta 0.10 --guidance-mode vjp --no-rollout-priors `
         --epochs "$Epochs" --batch-size "$BatchSize" --lr "$Lr" --seed "$AblSeed" --eval-split dev_select
 }
 
 if ($Stage -in @("all", "abl_budget_delta")) {
     $mainCkpt = "$OutputRoot\stage1_main_K4_P8\seed_$AblSeed\best.pt"
     if (-not (Test-Path -LiteralPath $mainCkpt -PathType Leaf)) { throw "Missing required checkpoint: $mainCkpt" }
-    foreach ($bLos in @(16, 32)) {
-        Invoke-ExperimentPython "$V6Dir\scripts\validate_diffusion.py" @CommonArgs `
-            --run-dir "$OutputRoot\stage4_budget_delta\Blos${bLos}_seed_$AblSeed" `
-            --K 4 --P 8 --delta 0.10 --B-los "$bLos" --guidance-mode vjp `
-            --resume $mainCkpt --eval-split dev_select
-    }
     foreach ($dVal in @(0.05, 0.20)) {
         Invoke-ExperimentPython "$V6Dir\scripts\validate_diffusion.py" @CommonArgs `
             --run-dir "$OutputRoot\stage4_budget_delta\delta${dVal}_seed_$AblSeed" `

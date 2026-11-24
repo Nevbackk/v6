@@ -77,37 +77,33 @@ Gain path's exact-geometry blockwise backend. The two-body RK4 batch implementat
 is shared by the portable model; the serial adapter uses it for a single track.
 No KalmanNet network or experiment infrastructure is needed at runtime.
 
-## Model Plan V1 & Model Plan V2 Extensions
+## Per-frame orbit estimation
 
-Building directly on the frozen `Prepared` data loader and differentiable `float64` two-body RK4 physics, this repository also implements **Model Plan V1** and **Model Plan V2**:
+Each valid LOS arrival produces a prior and a posterior. The filter uses the time since the preceding valid sample, including across gaps and masked padding. The last observation is processed as it arrives.
 
-- **Shared Physics, STM & Stratified Evaluation**:
-  - `v6/models/reprojection.py`: analytical RK4 tangent-linear STM $\Phi(t_j, t_k)$, branchless $\mathrm{SO}(3)$ LOS tangent frames, spherical retraction $\mathrm{Exp}_{S^2}$, local Log-MSC chart $B_k$, sign-verified sensitivity $A = -D_y\nu(0)$, and `pois10`-compatible unequal-time triplet noise-floor calibration $\tau_k$.
-  - `v6/data/splits.py` & `v6/eval_metrics.py`: `source_id`-isolated `train_fit / train_calib / dev_select` splits, macro-checkpoint & `Block 2 + 30 s` scheduling, 4-cadence + `source_id`-equal tables, fair prior-referenced good-orbit harm rates, and cluster-paired bootstrap 95% CIs.
-- **Model Plan V1 (`v6/models/v1_ltr_lm.py`, `v6/models/v1_fd_asf.py`, `v6/training_v1.py`)**:
-  - Classical non-learned controls (`cl_gn1_pure`, `cl_gn1_matched`, `cl_window_lm`, `cl_full_prefix_wls`), Jacobian-free bounded refiners (`JF-BR-Vel`, `JF-BR-6D`), and learned trust-region preconditioned 1-step LM (`LTR-LM` with `joint_6d`, `schur_vel`, `lock_pos_vel`).
-  - Flagship `FD-ASF`: batch-invariant continuous-time Legendre tracklet encoder $(H_s, B_s)$, $2+4$ Lambert ($M=0$) & Attributable ambiguity charts with analytic Attributable and finite-difference Lambert volume factors, 4-layer Conditional RealNVP proposal trained on SNIS optimal forecast disagreement $q_k^\star \propto \pi_k\|\mathbf{h}_{k+1}-\bar{\mathbf{h}}_{k+1}\|_2$ with defensive mixing, prefix likelihood reweighting, and 3-condition dominance-gated publishing.
-  - Entry points: `scripts/train_v1.py`, `scripts/validate_v1.py`.
-- **Model Plan V2 (`v6/models/v2_asd_sc.py`, `v6/training_v2.py`)**:
-  - `ASD-SC`: progressive subspace bounded blind denoiser ($L=2$ microsteps, 0.5/0.9 directional log-error quantile head, deadzone $\chi_i$, bounded shrinkage $g_i \in [g_{\min}, 1]$), cross-gap thin-QR pending subspace transport $D^{-1}\Phi D V_p = QR$, $K_p$ conditional unlock & $E_a$ restricted writeback ($E_h^\top\Delta\mathbf{y}=0$), A/B/C causal re-anchoring, DAgger rollout buffer, 2-checkpoint cross-gap unrolling, $\{0, 60, 300\}\text{ s}$ multi-horizon risk, and switchable progressive step-increment supervision $T_\ell\mathbf{d}_\ell$.
-  - Entry points: `scripts/train_v2.py`, `scripts/validate_v2.py`.
+| Entry point | Initial state | Learned update |
+| --- | --- | --- |
+| `scripts/train_v1.py` | Known six-dimensional state at the initialization epoch | Propagate the known orbit by two-body RK4 and learn the distribution of angular measurement errors in its LOS tangent plane. Each frame returns a predicted LOS, angular covariance and predictive score. |
+| `scripts/train_v2.py` | Frozen, noisy Gauss-LS estimate | Apply the same angular noise model to center and whiten the new LOS likelihood, then run guided six-dimensional state diffusion. Propagate the resulting state samples and reference covariance to the next observation. |
 
-## Diffusion filters for optical orbit estimation
+For a live stream, call `state = model.start_track(x0, t0)` once and `model.step(state, tk, los, station)` on each arrival. Independent tracks own their history, noise estimator and random generator. Batch rollout invokes the same step.
 
-Use `scripts/train_diffusion.py` and `scripts/validate_diffusion.py` with the same frozen prepared root and protocol directory as the V1 and V2 trainers.
-
-| `--route` | Estimator |
-| --- | --- |
-| `a` | A cosine variance-preserving diffusion filter denoises the six-dimensional initialization error. Each reverse step uses a locally linearized angular likelihood and a denoiser vector–Jacobian product. TRAIN-fit sources calibrate the initial mean error and covariance. |
-| `b1` | A cosine flow-matching proposal samples range coordinates on an Attributable or Lambert chart. Its invertible substeps have explicit log-determinants. Importance weights include the angular likelihood, physical chart volume and proposal density. |
-| `b2` | A stochastic Gaussian reverse chain uses learned proposal drifts, intermediate angular potentials and ancestry-aware resampling. The terminal importance ratio targets the same feasible chart as B1. |
+Both versions use a learned **reverse Markov chain in angular noise space**. A cosine VP forward process defines intermediate noise levels. Each reverse transition conditions on the current latent, the noise level and geometry available before the new measurement. The last step combines conditional means and variances. V2 additionally integrates a guided probability-flow ODE for the orbit error. `--K` controls artificial-time integration and `--P` controls Monte Carlo sampling. Physical time always comes from the recorded epochs.
 
 ```bash
-python scripts/train_diffusion.py --route b1 --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/b1 --K 4 --P 8
-python scripts/validate_diffusion.py --run-dir runs/b1 --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --eval-split dev_select
+python scripts/train_v1.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v1
+python scripts/train_v2.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v2 --sensor-checkpoint runs/v1/best.pt
+python scripts/validate_v2.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v2 --eval-split paired_val
 ```
 
-`--K` sets the number of artificial-time intervals and `--P` the particle count. Route A uses `--delta` for its covariance floor. `--B-los` optionally limits likelihood evaluations to a subset of observations. The selected checkpoint includes the route and source split. Validation defaults to `best.pt`, and training resumes from `last.pt`. Use `--eval-split paired_val` for a locked configuration.
+The clean V1 control uses `initial_truth_state_si` in the initialization record when supplied, or reference ephemeris at or before that epoch in the prepared shard. V2 also supports joint training from scratch. A transferred sensor must come from the same source split. V1 selects checkpoints on held-out tangent-plane measurement NLL (Gaussian moment approximation). V2 selects on source-equal, full-track six-state scaled MSE. The evaluation includes all valid frames, last-frame errors, four cadence tables and initialization strata. Models using the new recursion require a fresh training run.
 
-The Bash and PowerShell experiment runners provide `main`, `b1`, `b2` and `test` stages. `paired_val`, `paired_b1` and `paired_b2` validate saved Route A, B1 and B2 runs, respectively. The CPU tests include two-body synthetic tracks and temporary prepared data that exercise all three training and validation entry points.
+The `main` stages in `scripts/run_experiment_v1.{sh,ps1}` and `scripts/run_experiment_v2.{sh,ps1}` train these versions. Specify `SENSOR_CHECKPOINT` when initializing the V2 runner from V1. The `paired_val` stage validates each version's saved best model.
 
+## Alternative estimators
+
+- `train_v1.py --arch ltr_lm`, `jf_br`, `fd_asf` and the `cl_*` controls use the clean-start protocol. Each valid arrival triggers propagation and a causal refinement or particle update.
+- `train_v2.py --arch asd_sc` runs the noisy-start subspace control. The next valid frame tests each frozen range candidate. Two-frame training uses the actual following epoch for its forecast loss.
+- `train_diffusion.py --route a` runs the V2 state diffusion filter. `--route b1` samples invertible chart flow proposals; `--route b2` uses twisted SMC with explicit transition densities. Both chart alternatives update the orbit posterior at each arrival. The optional `--B-los` budget subsamples proposal guidance, and terminal importance weights use the full available LOS prefix.
+
+See the [model equations and experimental protocol](docs/METHODS_V1_V2_CN.md). Run `python -s -m unittest discover -s tests -v` for the CPU suite.

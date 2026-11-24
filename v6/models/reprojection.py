@@ -13,18 +13,16 @@ Model Plan V2 (ASD-SC):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Sequence
+import heapq
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 from torch import Tensor
 
 from .batched_physics import (
-    DTYPE,
     MAX_SUBSTEP_SEC,
     MU_EARTH_M3_S2,
-    STATE_SCALE_VALUES,
     state_scale,
 )
 
@@ -530,102 +528,130 @@ def reproject_causal_window_single(
     )
 
 
-def estimate_online_los_noise_floor(
-    times_sec: Tensor | np.ndarray,
-    observed_los: Tensor | np.ndarray,
-    station_ids: Tensor | np.ndarray | None = None,
-    station_id_reliable: Tensor | np.ndarray | None = None,
-    valid_mask: Tensor | np.ndarray | None = None,
+class RunningLOSNoise:
+    """Causal noise scale from the running median of same-platform LOS triplets."""
+
+    def __init__(
+        self,
+        *,
+        dt_cal_max_sec=50.0,
+        kappa_dist=0.8493218002880191,
+        n_min_triplets=3,
+        default_sigma_rad=5.0e-4,
+    ):
+        self.span = dt_cal_max_sec
+        self.factor = kappa_dist
+        self.minimum = n_min_triplets
+        self.sigma = float(default_sigma_rad)
+        self.count = 0
+        self._lower, self._upper = [], []
+        self._older = self._previous = None
+        self._same_pair = False
+
+    def observe(self, time_sec, los, station=None, station_id=None, reliable=None):
+        u = np.asarray(los, dtype=np.float64)
+        u = u / max(np.linalg.norm(u), 1.0e-15)
+        st = None if station is None else np.asarray(station, dtype=np.float64).copy()
+        trusted = station_id is not None and (reliable is None or bool(reliable))
+        same = False
+        if self._previous is not None:
+            tm, um, sm, sid, known = self._previous
+            dt = time_sec - tm
+            if trusted and known:
+                same = station_id == sid
+            elif st is not None and sm is not None:
+                same = np.linalg.norm(st[:3] - sm[:3] - 0.5 * (st[3:] + sm[3:]) * dt) < 100.0
+            else:
+                same = True
+            if self._older is not None and self._same_pair and same:
+                tp, up = self._older[:2]
+                span = time_sec - tp
+                if dt > 0 and tm > tp and 1.0e-6 < span <= self.span:
+                    a = dt / span
+                    b = 1.0 - a
+                    residual = um - a * up - b * u
+                    value = np.linalg.norm(residual - (um @ residual) * um) / math.sqrt(1 + a * a + b * b)
+                    if not self._lower or value <= -self._lower[0]:
+                        heapq.heappush(self._lower, -value)
+                    else:
+                        heapq.heappush(self._upper, value)
+                    if len(self._lower) > len(self._upper) + 1:
+                        heapq.heappush(self._upper, -heapq.heappop(self._lower))
+                    elif len(self._upper) > len(self._lower):
+                        heapq.heappush(self._lower, -heapq.heappop(self._upper))
+                    self.count += 1
+                    if self.count >= self.minimum:
+                        median = (
+                            -self._lower[0]
+                            if len(self._lower) != len(self._upper)
+                            else (self._upper[0] - self._lower[0]) / 2
+                        )
+                        self.sigma = max(self.factor * median, 1.0e-7)
+        self._older, self._previous = self._previous, (time_sec, u, st, station_id, trusted)
+        self._same_pair = same
+
+
+def los_noise_profile(
+    times_sec,
+    observed_los,
+    station_ids=None,
+    station_id_reliable=None,
+    valid_mask=None,
     *,
-    up_to_idx: int,
-    dt_cal_max_sec: float = 50.0,
-    kappa_dist: float = 0.8493218002880191,  # 1 / sqrt(2 ln 2)
-    c_tau: float = 3.0,
-    n_min_triplets: int = 3,
-    default_sigma_rad: float = 5.0e-4,
-    station_states_si: Tensor | np.ndarray | None = None,
-) -> tuple[float, float, int]:
-    """Causal unequal-time triplet interpolation angular noise-floor estimator (pois10-safe).
+    station_states_si=None,
+    **options,
+):
+    def cpu(x):
+        return None if x is None else torch.as_tensor(x).detach().cpu().numpy()
 
-    Uses only triplets (m-1, m, m+1) with m+1 <= up_to_idx, same station, and total span
-    t_{m+1} - t_{m-1} <= dt_cal_max_sec:
-        a_m = (t_{m+1} - t_m) / (t_{m+1} - t_{m-1}),  b_m = 1 - a_m
-        xi_m = E_{perp,m}^T (u_m - a_m u_{m-1} - b_m u_{m+1})
-        sigma_hat = kappa_dist * median( ||xi_m||_2 / sqrt(1 + a_m^2 + b_m^2) )
+    times, obs, stations = cpu(times_sec), cpu(observed_los), cpu(station_states_si)
+    ids, known, mask = cpu(station_ids), cpu(station_id_reliable), cpu(valid_mask)
+    tracker = RunningLOSNoise(**options)
+    sigmas, counts = np.empty(len(times)), np.empty(len(times), dtype=np.int64)
+    for k, time_sec in enumerate(times):
+        if mask is None or mask[k]:
+            tracker.observe(
+                float(time_sec),
+                obs[k],
+                None if stations is None else stations[k],
+                None if ids is None else ids[k],
+                None if known is None else known[k],
+            )
+        sigmas[k], counts[k] = tracker.sigma, tracker.count
+    return sigmas, counts
 
-    Returns:
-        tau_k: deadzone threshold c_tau * sigma_hat (radians).
-        sigma_hat: estimated per-axis angular noise std (radians).
-        num_triplets: number of valid causal triplets |C_k|.
-    """
+
+def estimate_online_los_noise_floor(
+    times_sec,
+    observed_los,
+    station_ids=None,
+    station_id_reliable=None,
+    valid_mask=None,
+    *,
+    up_to_idx,
+    c_tau=3.0,
+    default_sigma_rad=5.0e-4,
+    station_states_si=None,
+    **options,
+):
     if up_to_idx < 2:
-        sigma = float(default_sigma_rad)
-        return float(c_tau * sigma), sigma, 0
+        return c_tau * default_sigma_rad, default_sigma_rad, 0
+    end = up_to_idx + 1
 
-    t_all = np.asarray(times_sec, dtype=np.float64).reshape(-1)[: up_to_idx + 1]
-    u_all = np.asarray(observed_los, dtype=np.float64).reshape(-1, 3)[: up_to_idx + 1]
-    if valid_mask is None:
-        v_all = np.ones(t_all.shape, dtype=bool)
-    else:
-        v_all = np.asarray(valid_mask, dtype=bool).reshape(-1)[: up_to_idx + 1]
+    def prefix(x):
+        return None if x is None else x[:end]
 
-    idx = np.flatnonzero(v_all)
-    if idx.size < 3:
-        sigma = float(default_sigma_rad)
-        return float(c_tau * sigma), sigma, 0
-
-    t = t_all[idx]
-    u = u_all[idx]
-    u = u / np.clip(np.linalg.norm(u, axis=-1, keepdims=True), 1.0e-15, None)
-
-    t_prev, t_mid, t_next = t[:-2], t[1:-1], t[2:]
-    span = t_next - t_prev
-    good = (span > 1.0e-6) & (span <= float(dt_cal_max_sec)) & (t_mid > t_prev) & (t_next > t_mid)
-
-    same_pair = np.ones(idx.size - 1, dtype=bool)
-    if station_states_si is not None:
-        stations = torch.as_tensor(station_states_si).detach().cpu().numpy().reshape(-1, 6)[idx]
-        # A moving LEO platform travels kilometres between samples. Identify jumps
-        # relative to its measured velocity, not to a stationary observer.
-        dr = np.diff(stations[:, :3], axis=0)
-        predicted = .5*(stations[1:, 3:]+stations[:-1, 3:])*np.diff(t)[:, None]
-        same_pair = np.linalg.norm(dr-predicted, axis=1) < 100.
-    if station_ids is not None:
-        ids = torch.as_tensor(station_ids).detach().cpu().numpy().reshape(-1)[idx]
-        reliable = (np.ones(idx.size, dtype=bool) if station_id_reliable is None else
-                    torch.as_tensor(station_id_reliable).detach().cpu().numpy().reshape(-1)[idx].astype(bool))
-        trusted = reliable[1:] & reliable[:-1]
-        same_pair[trusted] = (ids[1:] == ids[:-1])[trusted]
-    good &= same_pair[:-1] & same_pair[1:]
-
-    triplet_pos = np.flatnonzero(good)
-    n_triplets = int(triplet_pos.size)
-    if n_triplets < int(n_min_triplets):
-        sigma = float(default_sigma_rad)
-        return float(c_tau * sigma), sigma, n_triplets
-
-    tp = t_prev[triplet_pos]
-    tm = t_mid[triplet_pos]
-    tn = t_next[triplet_pos]
-    sp = tn - tp
-    a_m = (tn - tm) / sp
-    b_m = (tm - tp) / sp
-
-    u_m = torch.as_tensor(u[1:-1][triplet_pos], dtype=torch.float64)
-    u_p = torch.as_tensor(u[:-2][triplet_pos], dtype=torch.float64)
-    u_n = torch.as_tensor(u[2:][triplet_pos], dtype=torch.float64)
-    a_t = torch.as_tensor(a_m, dtype=torch.float64).unsqueeze(-1)
-    b_t = torch.as_tensor(b_m, dtype=torch.float64).unsqueeze(-1)
-
-    _, E_perp_m = build_los_frame(u_m)
-    detrended_3d = u_m - a_t * u_p - b_t * u_n
-    xi_m = torch.einsum("mci,mc->mi", E_perp_m, detrended_3d)
-    norm_factor = torch.sqrt(1.0 + a_t.squeeze(-1).square() + b_t.squeeze(-1).square())
-    scaled_norms = (torch.linalg.vector_norm(xi_m, dim=-1) / norm_factor).numpy()
-
-    sigma_hat = float(kappa_dist * float(np.median(scaled_norms)))
-    sigma_hat = max(sigma_hat, 1.0e-7)
-    return float(c_tau * sigma_hat), sigma_hat, n_triplets
+    sigmas, counts = los_noise_profile(
+        prefix(times_sec),
+        prefix(observed_los),
+        prefix(station_ids),
+        prefix(station_id_reliable),
+        prefix(valid_mask),
+        station_states_si=prefix(station_states_si),
+        default_sigma_rad=default_sigma_rad,
+        **options,
+    )
+    return float(c_tau * sigmas[-1]), float(sigmas[-1]), int(counts[-1])
 
 
 def deadzone_gate_alpha(median_angle_rad: Tensor | float, tau_rad: Tensor | float) -> Tensor:

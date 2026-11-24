@@ -1,13 +1,4 @@
-"""Training and stratified evaluation for Round 5 Genuine Diffusion Models (Route A & Route B).
-
-Strict experimental hygiene:
-- Frozen --split-seed decoupled from training --seed.
-- Refuses --eval-split paired_val during training (DEV-select only for model selection).
-- Route A (VP-OrbitDiff): single multi-scale cosine-VP velocity + second-moment NLL objective,
-  supporting causal rollout prior aggregation and guidance/K/P/delta ablations.
-- Route B1 (Guided Cosine Flow 2D): single importance-corrected 3D-chord cosine-CFM loss
-  covering both Attributable and Lambert charts + both branches + 4D angular relaxation.
-"""
+"""Training and held-out evaluation for the two initialization protocols and chart proposals."""
 
 from __future__ import annotations
 
@@ -22,22 +13,16 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
-from .data.observation_clock import causal_diffusion_events
 from .checkpoints import read_checkpoint, restore_training_state, save_epoch
 from .reference_prior import fit_reference_prior
-from .data.splits import parse_observation_blocks, partition_prepared_keys_by_source
+from .data.splits import partition_prepared_keys_by_source
 from .models.batched_physics import state_scale
 from .models.diffusion_orbit import (
     HALF_PI,
     RouteBGuidedCosineFlow2D,
     VPOrbitDiffusionFilter,
-    propagate_reference_covariance_stm,
     safe_cholesky_spd,
     vp_velocity_moment_loss,
-)
-from .models.reprojection import (
-    estimate_online_los_noise_floor,
-    propagate_si_with_stm,
 )
 from .models.v1_fd_asf import ContinuousTrackletEncoder
 from .models.orbit_proposals import EmptyTeacherSupport, RouteBOrbitFilter, draw_chart_teacher
@@ -53,137 +38,61 @@ def train_route_a_vp_step_on_record(
     rollout_prior_prob: float = 0.5,
     device: torch.device | str = "cpu",
 ) -> Tensor:
-    """Single multi-scale cosine-VP velocity/moment training step on one multi-block record.
-
-    Trains f_theta(z_s, s, c^-) on causal (c^-, z_0) pairs collected from BOTH pure-propagation
-    B0 anchors and (when use_rollout_priors=True) detached closed-loop rollout-visited priors.
-    Context c^- strictly excludes the fresh unassimilated batch Y so inference guidance never
-    double-counts observations!
-    """
-    dev = torch.device(device)
-    dtype = torch.float64
-    d_scale = state_scale(device=dev, dtype=dtype)
-
-    x0 = torch.as_tensor(record["initial_state_si"], device=dev, dtype=dtype)
-    t_init = float(record["init_time_sec"])
-    times = torch.as_tensor(record["times_sec"], dtype=dtype)
-    obs = torch.as_tensor(record["observed_los"], device=dev, dtype=dtype)
-    stn = torch.as_tensor(record["station_states_si"], device=dev, dtype=dtype)
-    truth = torch.as_tensor(record["truth_states_si"], device=dev, dtype=dtype)
-    valid = torch.as_tensor(
-        record.get("valid_mask", torch.ones(times.shape[0], dtype=torch.bool)), dtype=torch.bool
+    """Supervise the sensor at every arrival and V2 on the six-dimensional prior error."""
+    x = torch.as_tensor(record["initial_state_si"], device=device, dtype=torch.float64)
+    obs = torch.as_tensor(record["observed_los"]).to(x)
+    stations = torch.as_tensor(record["station_states_si"]).to(x)
+    truth = torch.as_tensor(record["truth_states_si"]).to(x)
+    times = torch.as_tensor(record["times_sec"]).cpu().double()
+    t0 = float(record["init_time_sec"])
+    mask = record.get("valid_mask")
+    pure = model.known_initial or not use_rollout_priors or random.random() >= rollout_prior_prob
+    roll = model.rollout_track(
+        initial_state_si=x,
+        init_time_sec=t0,
+        times_sec=times,
+        observed_los=obs,
+        station_states_si=stations,
+        valid_mask=mask,
+        training_pairs=True,
+        pure_prior=pure,
+        seed=random.randrange(2**30),
+        **{
+            k: record[k]
+            for k in ("initial_station_si", "station_ids", "station_id_reliable")
+            if k in record
+        },
     )
-
-    blocks = parse_observation_blocks(times, valid, init_time_sec=t_init)
-    if not blocks:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
-
-    # Collect causal anchor tuples: (prior_x_si, P_ref_in, eval_time_sec, truth_at_eval_si, prev_idx, sigma_past)
-    anchors: list[tuple[Tensor, Tensor, float, Tensor, int, float]] = []
-    if use_rollout_priors and random.random() < float(rollout_prior_prob):
-        was_training = model.training
-        model.eval()
-        roll = model.rollout_track(
-            initial_state_si=x0,
-            init_time_sec=t_init,
-            times_sec=times,
-            observed_los=obs,
-            station_states_si=stn,
-            valid_mask=valid,
-            seed=random.randint(1, 2**30 - 1),
-            **{key: record[key] for key in ("block_start_time_sec", "station_ids", "station_id_reliable",
-                                            "initial_station_si", "readout_until_sec")
-               if key in record},
-        )
-        if was_training:
-            model.train()
-        for bt in roll["batch_traces"]:
-            ev_t = float(bt["eval_time_sec"])
-            last_idx = int(bt["last_obs_idx"])
-            dt_tr = ev_t - float(times[last_idx].item())
-            if abs(dt_tr) > 1.0e-9:
-                truth_ev, _ = propagate_si_with_stm(truth[last_idx], dt_tr, compute_stm=False)
-            else:
-                truth_ev = truth[last_idx]
-            anchors.append(
-                (
-                    bt["prior_state_si"].detach(),
-                    bt["P_carry_in"].detach(),
-                    ev_t,
-                    truth_ev.detach(),
-                    int(bt["prev_assimilated_idx"]),
-                    float(bt["sigma_past_rad"]),
-                )
+    pairs = roll["training_pairs"]
+    if not pairs:
+        raise ValueError("No valid frame for diffusion training")
+    angular, sensor_inputs, state_errors, state_inputs = [], [], [], []
+    hidden = None if model.known_initial else x.new_zeros(model.tracklet_encoder.context_dim)
+    scale = state_scale(device=x.device, dtype=x.dtype)
+    for count, (frame, prior, carry, tangent, sensor_ctx, sigma) in enumerate(pairs):
+        k = frame.index
+        true_ray = torch.nn.functional.normalize(truth[k, :3] - stations[k, :3], dim=0)
+        angular.append(tangent.T @ (torch.nn.functional.normalize(obs[k], dim=0) - true_ray) / sigma)
+        sensor_inputs.append(sensor_ctx)
+        if hidden is not None:
+            L = safe_cholesky_spd(carry)
+            state_errors.append(
+                torch.linalg.solve_triangular(L, ((truth[k] - prior) / scale)[:, None], upper=False)[:, 0]
             )
-    else:
-        station = record.get("initial_station_si")
-        station_at_init = x0.new_zeros(6) if station is None else torch.as_tensor(station).to(x0)
-        curr_x, P_ref = model.initial_moments(x0, station_at_init)
-        curr_t = t_init
-        prev_idx = -1
-        events = causal_diffusion_events(times, valid, t_init, record.get("block_start_time_sec"),
-                                         readout_until_sec=record.get("readout_until_sec"))
-        for ev_t, last_idx, _ in events:
-            if last_idx <= prev_idx:
-                continue
-            dt = ev_t - curr_t
-            if abs(dt) > 0.0:
-                curr_x, phi_step = propagate_si_with_stm(curr_x.detach(), dt, compute_stm=True)
-                assert phi_step is not None
-                P_ref = propagate_reference_covariance_stm(P_ref, phi_step)
-                curr_t = ev_t
-            if prev_idx >= 0:
-                _, sigma_past, _ = estimate_online_los_noise_floor(
-                    times, obs.detach().cpu(), valid_mask=valid, up_to_idx=prev_idx,
-                    default_sigma_rad=model.default_sigma_rad,
-                    station_states_si=stn, station_ids=record.get("station_ids"),
-                    station_id_reliable=record.get("station_id_reliable"),
-                )
-            else:
-                sigma_past = model.default_sigma_rad
-            truth_ev, _ = propagate_si_with_stm(truth[last_idx], curr_t-times[last_idx].item(), compute_stm=False)
-            anchors.append((curr_x.detach(), P_ref.detach(), curr_t, truth_ev.detach(), prev_idx, sigma_past))
-            prev_idx = last_idx
-
-    if not anchors:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
-
-    losses: list[Tensor] = []
-    M = max(1, int(num_noise_samples))
-    for prior_x, P_in, ev_t, truth_ev, prev_idx, sigma_past in anchors:
-        L_b = safe_cholesky_spd(P_in)
-        ctx_past = model.build_causal_past_context(
-            prior_state_si=prior_x,
-            L_b=L_b,
-            eval_time_sec=ev_t,
-            init_time_sec=t_init,
-            times_sec=times,
-            observed_los=obs,
-            station_states_si=stn,
-            valid_mask=valid,
-            prev_assimilated_idx=prev_idx,
-            sigma_u_rad=sigma_past,
-        )
-        # Whitened clean target z_0 = L_b^{-1} D^{-1} (x* - x^-)
-        err_scaled = (truth_ev - prior_x) / d_scale
-        z_0 = torch.linalg.solve_triangular(L_b, err_scaled.unsqueeze(-1), upper=False).squeeze(-1).detach()
-
-        # The loss is defined at both endpoints; train over the full cosine path.
-        s = torch.rand((M,), device=dev, dtype=dtype) * HALF_PI
-        eps = torch.randn((M, 6), device=dev, dtype=dtype)
-        alpha = torch.cos(s).unsqueeze(-1)
-        sigma = torch.sin(s).unsqueeze(-1)
-        z_s = alpha * z_0.unsqueeze(0) + sigma * eps
-        v_star = alpha * eps - sigma * z_0.unsqueeze(0)
-
-        v_theta, V_theta, _, _ = model.denoiser(z_s, s, ctx_past)
-        losses.append(
-            vp_velocity_moment_loss(
-                v_star, v_theta, V_theta, fixed_isotropic_v=model.fixed_isotropic_v
-            )
-        )
-
-    return torch.stack(losses).mean()
+            state_inputs.append(model.state_context(prior, L, frame.time_sec - t0, sigma, count, hidden))
+            hidden = model.tracklet_encoder.advance(hidden.detach(), obs[k], stations[k], frame.dt_sec)
+    loss = model.sensor.loss(torch.stack(angular), torch.stack(sensor_inputs))
+    if model.known_initial:
+        return loss
+    clean = torch.stack(state_errors).repeat_interleave(num_noise_samples, dim=0)
+    ctx = torch.stack(state_inputs).repeat_interleave(num_noise_samples, dim=0)
+    s = torch.rand(len(clean), device=x.device, dtype=x.dtype) * HALF_PI
+    a, b = s.cos()[:, None], s.sin()[:, None]
+    eps = torch.randn_like(clean)
+    v, V, _, _ = model.denoiser(a * clean + b * eps, s, ctx)
+    return loss + vp_velocity_moment_loss(
+        a * eps - b * clean, v, V, fixed_isotropic_v=model.fixed_isotropic_v
+    )
 
 
 def train_route_b_cosine_flow_step_on_record(
@@ -202,16 +111,28 @@ def train_route_b_cosine_flow_step_on_record(
     return flow_b.cosine_cfm_loss(z, branch, eta, w_star if use_chord_disagreement else w_pi, context)
 
 
-def main(evaluation: bool = False) -> None:
-    parser = argparse.ArgumentParser(description="Round 5 Genuine Diffusion Trainer & Validator (Route A & B)")
+def main(evaluation: bool = False, *, version="v2") -> None:
+    parser = argparse.ArgumentParser(
+        description=f"Per-frame orbit diffusion ({version.upper()})",
+        epilog="Use --arch ltr_lm or fd_asf for V1 controls; use --arch asd_sc for the V2 control.",
+    )
     parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument("--protocol-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--arch", choices=("diffusion",), default="diffusion")
+    parser.add_argument(
+        "--sensor-checkpoint", type=Path, help="Initialize the V2 sensor model from a V1 checkpoint"
+    )
     parser.add_argument("--route", choices=("a", "b1", "b2"), default="a")
     parser.add_argument("--K", type=int, default=4, help="Core knob 1: artificial reverse diffusion intervals")
     parser.add_argument("--P", type=int, default=8, help="Core knob 2: independent seeds / particles")
     parser.add_argument("--delta", type=float, default=0.10, help="Core knob 3: min reference covariance fraction")
-    parser.add_argument("--B-los", type=int, default=0, help="Optional knob 4: raw fresh LOS budget (0 = full fresh batch)")
+    parser.add_argument(
+        "--B-los",
+        type=int,
+        default=0,
+        help="B1/B2 proposal guidance LOS budget (0 uses the complete prefix)",
+    )
     parser.add_argument("--guidance-mode", default="vjp", choices=("vjp", "identity_jac", "none"))
     parser.add_argument("--fixed-isotropic-v", action="store_true", help="Ablation: fix V_theta = I")
     parser.add_argument("--no-rollout-priors", action="store_true", help="Ablation: pure B0 propagation priors only")
@@ -229,8 +150,20 @@ def main(evaluation: bool = False) -> None:
 
     if not evaluation and args.eval_split == "paired_val":
         parser.error("Training/model selection MUST use --eval-split dev_select; reserve paired_val for locked validation.")
-    config_keys = ("route", "K", "P", "delta", "B_los", "guidance_mode", "fixed_isotropic_v",
-                   "no_rollout_priors", "split_seed", "seed")
+    args.version = version
+    config_keys = (
+        "version",
+        "route",
+        "K",
+        "P",
+        "delta",
+        "B_los",
+        "guidance_mode",
+        "fixed_isotropic_v",
+        "no_rollout_priors",
+        "split_seed",
+        "seed",
+    )
     ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys,
                            eval_overrides=("K", "P", "B_los", "guidance_mode", "delta"))
     if args.K < 1 or args.P < 1 or args.B_los < 0 or not 0 < args.delta <= 1:
@@ -238,21 +171,50 @@ def main(evaluation: bool = False) -> None:
     if args.route != "a" and (args.guidance_mode == "identity_jac" or args.fixed_isotropic_v
                               or args.no_rollout_priors or args.delta != parser.get_default("delta")):
         parser.error("identity_jac, fixed-isotropic-v, no-rollout-priors and delta tuning apply to Route A")
+    if args.route == "a" and args.B_los:
+        parser.error(
+            "Route A assimilates one fresh LOS per frame; --B-los limits chart guidance on Routes B1/B2"
+        )
+    if version == "v1" and (
+        args.no_rollout_priors
+        or args.fixed_isotropic_v
+        or args.guidance_mode != "vjp"
+        or args.delta != parser.get_default("delta")
+    ):
+        parser.error("Orbit prior and guidance ablations apply to noisy-initial V2")
+    if version == "v1" and args.route != "a":
+        parser.error("The exact-initial diffusion model uses the angular observation chain")
+    if args.sensor_checkpoint and (version != "v2" or args.route != "a" or evaluation or ckpt):
+        parser.error("--sensor-checkpoint initializes a new V2 Route A training run")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     args.run_dir.mkdir(parents=True, exist_ok=True)
 
     if args.route == "a":
-        model = VPOrbitDiffusionFilter(num_reverse_steps=args.K, num_particles=args.P,
-                                       delta=args.delta, los_budget=args.B_los or None,
-                                       guidance_mode=args.guidance_mode,
-                                       fixed_isotropic_v=args.fixed_isotropic_v)
+        model = VPOrbitDiffusionFilter(
+            num_reverse_steps=args.K,
+            num_particles=args.P,
+            delta=args.delta,
+            guidance_mode=args.guidance_mode,
+            fixed_isotropic_v=args.fixed_isotropic_v,
+            known_initial=(version == "v1"),
+        )
     else:
         model = RouteBOrbitFilter(args.route, num_steps=args.K, num_particles=args.P,
                                   los_budget=args.B_los or None,
                                   use_guidance=args.guidance_mode != "none")
     model.to(args.device)
+    if args.sensor_checkpoint:
+        source = torch.load(args.sensor_checkpoint, map_location="cpu", weights_only=True)
+        if source.get("version") != "v1":
+            parser.error("Expected a V1 angular diffusion checkpoint")
+        if source.get("recursion") != "valid_frame" or source.get("split_seed") != args.split_seed:
+            parser.error("The sensor checkpoint must use the same per-frame protocol and source split seed")
+        model.sensor.load_state_dict(
+            {k.removeprefix("sensor."): v for k, v in source["model"].items() if k.startswith("sensor.")},
+            strict=True,
+        )
 
     last_ckpt = args.run_dir / "last.pt"
     start_epoch = 1
@@ -273,7 +235,12 @@ def main(evaluation: bool = False) -> None:
 
     def _pack_eval(prep: Prepared, keys: Sequence[str]):
         return (
-            (k, str(prep.rows[k]["record_key"]["source_id"]), str(prep.rows[k]["record_key"]["rhythm"]), prep.record(k))
+            (
+                k,
+                str(prep.rows[k]["record_key"]["source_id"]),
+                str(prep.rows[k]["record_key"]["rhythm"]),
+                prep.record(k, exact_initial=(version == "v1")),
+            )
             for k in keys
         )
 
@@ -285,13 +252,13 @@ def main(evaluation: bool = False) -> None:
 
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
     fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
-    if args.route == "a" and model.reference_prior is None:
+    if args.route == "a" and version == "v2" and model.reference_prior is None:
         model.reference_prior = fit_reference_prior(train_prep, fit_keys)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     def selection_score(summary):
-        overall = summary["overall"]
-        return float(overall.get("v2_primary_block2_t30_forecast300_pos_km",
-                                 overall["position_km"])["capped_mean"])
+        if version == "v1":
+            return summary["overall"]["observation_nll"]
+        return summary["source_equal_summary"]["scaled_mse"]
     best_score = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -307,23 +274,35 @@ def main(evaluation: bool = False) -> None:
         for start in range(0, len(shuffled), args.batch_size):
             batch_keys = shuffled[start : start + args.batch_size]
             optimizer.zero_grad(set_to_none=True)
-            batch_losses = []
-            for k in batch_keys:
-                record = train_prep.record(k)
+            total_loss = 0.0
+            count = 0
+            for key in batch_keys:
+                record = train_prep.record(key, exact_initial=(version == "v1"))
                 if args.route == "a":
-                    batch_losses.append(train_route_a_vp_step_on_record(
-                        model, record, use_rollout_priors=not args.no_rollout_priors, device=args.device))
+                    term = train_route_a_vp_step_on_record(
+                        model, record, use_rollout_priors=not args.no_rollout_priors, device=args.device
+                    )
                 else:
                     try:
-                        batch_losses.append(train_route_b_cosine_flow_step_on_record(
-                            model.flow, model.encoder, record, device=args.device, los_budget=model.los_budget))
+                        term = train_route_b_cosine_flow_step_on_record(
+                            model.flow,
+                            model.encoder,
+                            record,
+                            device=args.device,
+                            los_budget=model.los_budget,
+                        )
                     except EmptyTeacherSupport:
                         skipped += 1
-            if not batch_losses:
+                        continue
+                term.backward()
+                total_loss += float(term.detach())
+                count += 1
+            if not count:
                 continue
-            trained_records += len(batch_losses)
-            loss = torch.stack(batch_losses).mean()
-            loss.backward()
+            trained_records += count
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.div_(count)
             gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             print(
@@ -331,7 +310,7 @@ def main(evaluation: bool = False) -> None:
                     {
                         "epoch": epoch,
                         "cursor": start + len(batch_keys),
-                        "train_loss": float(loss.detach().item()),
+                        "train_loss": total_loss / count,
                         "grad_norm": float(gnorm.item()),
                         "teacher_skipped": skipped,
                     }

@@ -9,7 +9,7 @@ Implements the complete co-signed evaluation specification across:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -17,7 +17,7 @@ from torch import Tensor
 
 from .data.splits import B0_ERROR_STRATA_KM, CADENCE_NAMES, b0_stratum_label
 from .models.batched_physics import STATE_SCALE_VALUES
-from .models.reprojection import build_los_frame, propagate_si_with_stm
+from .models.reprojection import build_los_frame
 
 
 @dataclass(frozen=True)
@@ -31,12 +31,12 @@ class RecordEvalRow:
     pos_rmse_km: float
     vel_rmse_mps: float
     scaled_mse: float
-    block6_end_vel_rmse_mps: float | None
-    block6_end_radial_pos_km: float | None
+    last_frame_vel_mps: float | None
+    last_frame_radial_pos_km: float | None
     is_finite: bool
     diverged: bool
     prior_pos_rmse_km: float | None = None
-    block2_t30_forecast300_pos_km: float | None = None
+    observation_nll: float | None = None
     valid_frames: int = 0
     eligible_prior_epochs: int = 0
     newly_harmed_epochs: int = 0
@@ -173,9 +173,8 @@ def summarize_record_rows(
         pos = np.array([r.pos_rmse_km if r.is_finite else np.inf for r in subset], dtype=np.float64)
         vel = np.array([r.vel_rmse_mps if r.is_finite else np.inf for r in subset], dtype=np.float64)
         smse = np.array([r.scaled_mse if r.is_finite else np.inf for r in subset], dtype=np.float64)
-        sixth = [r for r in subset if r.block6_end_vel_rmse_mps is not None]
-        b6_v = np.array([r.block6_end_vel_rmse_mps for r in sixth], dtype=np.float64)
-        b6_r = np.array([abs(r.block6_end_radial_pos_km) for r in sixth], dtype=np.float64)
+        last_v = np.array([r.last_frame_vel_mps for r in subset], dtype=np.float64)
+        last_r = np.array([abs(r.last_frame_radial_pos_km) for r in subset], dtype=np.float64)
         nonfinite_rate = float(np.mean([not r.is_finite for r in subset]))
         diverged_rate = float(np.mean([r.diverged or (not r.is_finite) for r in subset]))
 
@@ -183,37 +182,33 @@ def summarize_record_rows(
         eligible = sum(r.eligible_prior_epochs for r in good_sub)
         harmed = sum(r.newly_harmed_epochs for r in good_sub)
 
-        b2_vals = np.array(
-            [
-                r.block2_t30_forecast300_pos_km
-                for r in subset
-                if r.block2_t30_forecast300_pos_km is not None
-            ],
-            dtype=np.float64,
-        )
+        noise_rows = [r for r in subset if r.observation_nll is not None]
         out: dict[str, Any] = {
             "count": n,
             "nonfinite_rate": nonfinite_rate,
             "diverged_rate_gt_1000km": diverged_rate,
-            "scaled_mse_finite_mean": float(np.mean(smse[np.isfinite(smse)])) if np.isfinite(smse).any() else float("inf"),
-            "position_km": _distribution_summary(pos, cap_for_diverged=max(divergence_pos_km * 10.0, 10000.0)),
+            "scaled_mse_finite_mean": float(np.mean(smse[np.isfinite(smse)]))
+            if np.isfinite(smse).any()
+            else float("inf"),
+            "position_km": _distribution_summary(
+                pos, cap_for_diverged=max(divergence_pos_km * 10.0, 10000.0)
+            ),
             "velocity_mps": _distribution_summary(vel, cap_for_diverged=10000.0),
-            "block6_count": len(sixth),
-            "block6_end_vel_mps": _distribution_summary(b6_v, cap_for_diverged=10000.0) if sixth else None,
-            "block6_end_radial_pos_km": _distribution_summary(b6_r, cap_for_diverged=10000.0) if sixth else None,
+            "last_frame_vel_mps": _distribution_summary(last_v, cap_for_diverged=10000.0),
+            "last_frame_radial_pos_km": _distribution_summary(last_r, cap_for_diverged=10000.0),
             "good_orbit_lt10km_new_harm_rate": harmed / eligible if eligible else None,
             "good_orbit_eligible_epochs": eligible,
             "good_orbit_new_harm_epochs": harmed,
-            "block2_endpoint_count": int(b2_vals.size),
             "attempted_proposal_batches": sum(r.attempted_batches for r in subset),
             "failed_proposal_batches": sum(r.failed_proposals for r in subset),
         }
         frames = sum(r.valid_frames for r in subset)
+        out["valid_frames"] = frames
         if frames:
             out["scaled_mse_pooled"] = sum(r.scaled_mse*r.valid_frames for r in subset if r.valid_frames) / frames
-        if b2_vals.size > 0:
-            out["v2_primary_block2_t30_forecast300_pos_km"] = _distribution_summary(
-                b2_vals, cap_for_diverged=10000.0
+        if noise_rows:
+            out["observation_nll"] = sum(r.observation_nll * r.valid_frames for r in noise_rows) / sum(
+                r.valid_frames for r in noise_rows
             )
         return out
 
@@ -251,6 +246,9 @@ def summarize_record_rows(
         "by_b0_stratum": by_stratum,
         "source_equal_summary": {
             "unique_sources": len(source_buckets),
+            "scaled_mse": float(
+                np.mean([np.mean([r.scaled_mse for r in grp]) for grp in source_buckets.values()])
+            ),
             "position_km": _distribution_summary(source_means_pos, cap_for_diverged=10000.0),
             "velocity_mps": _distribution_summary(source_means_vel, cap_for_diverged=10000.0),
         },
@@ -312,23 +310,6 @@ def cluster_paired_bootstrap_ci(
 
 
 @torch.no_grad()
-def evaluate_v2_primary_endpoint_forecast300(
-    published_state_at_b2_t30_si: Tensor,
-    truth_state_at_b2_t30_si: Tensor,
-    *,
-    horizon_sec: float = 300.0,
-) -> Tensor:
-    """Propagate both published state and truth at Block 2 + 30 s purely two-body for 300 s (km)."""
-    pred_f, _ = propagate_si_with_stm(
-        published_state_at_b2_t30_si, horizon_sec, compute_stm=False
-    )
-    true_f, _ = propagate_si_with_stm(
-        truth_state_at_b2_t30_si, horizon_sec, compute_stm=False
-    )
-    return torch.linalg.vector_norm(pred_f[..., :3] - true_f[..., :3], dim=-1) / 1000.0
-
-
-@torch.no_grad()
 def measure_secant_amplification(
     rollout_fn: Callable[[Tensor], Tensor],
     base_initial_state_si: Tensor,
@@ -350,7 +331,6 @@ __all__ = [
     "cluster_paired_bootstrap_ci",
     "compute_los_local_errors",
     "directional_benefit_metrics",
-    "evaluate_v2_primary_endpoint_forecast300",
     "measure_secant_amplification",
     "summarize_record_rows",
 ]
