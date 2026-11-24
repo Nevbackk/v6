@@ -59,12 +59,27 @@ class Prepared:
         if (set(self.rows) != keys or set(initial) != set(allowed)
                 or len(keys) != config[f"{split}_records"]):
             raise ValueError(f"Incomplete frozen {split} snapshot")
+        self._dense_start = {}
+        self._initial_epoch = {source: b0[0] for source, b0 in initial.items()}
+        self._initial_station = {}
         self.shard = lru_cache(maxsize=16)(self._load_shard)
 
     def _load_shard(self, sid):
         path = self.root / "prepared_cache" / self.split / "shards" / f"shard_{sid:06d}.pt"
         records = torch.load(path, map_location="cpu", weights_only=False)["records"]
         indexed = {identity(row): row for row in records}
+        for row in records:
+            source, rhythm, _ = identity(row)
+            if rhythm == "dense" and len(row["t"]):
+                self._dense_start[(sid, source)] = float(row["t"][0])
+                key = (sid, source)
+                if key in self._initial_epoch:
+                    epoch = self._initial_epoch[key]
+                    i = np.searchsorted(row["t"], epoch, side="right") - 1
+                    if i >= 0:
+                        station = np.array(row["sat_state"][i], dtype=np.float64, copy=True)
+                        station[:3] += station[3:] * (epoch - float(row["t"][i]))
+                        self._initial_station[key] = station
         if len(indexed) != len(records):
             raise ValueError(f"Duplicate records in {path}")
         return indexed
@@ -82,7 +97,15 @@ class Prepared:
                 or len(t) - start != self.length(key)
                 or not np.isfinite(t).all() or (np.diff(t) <= 0).any()):
             raise ValueError(f"Invalid observation times for {key}")
+        # Raw dense acquisition and all cadence variants of a source share one clock.
+        # A declared physical block opening takes precedence; older records fall back
+        # to the dense opening, or the shared initialization epoch if dense is absent.
+        start_time = row.get("block_start_time_sec", self._dense_start.get(
+            (int(init["shard_id"]), identity(init["record_key"])[0]), epoch))
         return dict(initial_state_si=init["initial_state"], init_time_sec=epoch,
+                    initial_station_si=self._initial_station.get((int(init["shard_id"]),
+                                                                  identity(init["record_key"])[0])),
+                    block_start_time_sec=float(start_time),
                     times_sec=t[start:], observed_los=np.asarray(row["los"])[start:],
                     station_states_si=np.asarray(row["sat_state"])[start:],
                     station_ids=np.asarray(row["sat_id"])[start:],

@@ -4,19 +4,20 @@ Complete Execution Pipeline — Model Plan V2 (ASD-SC Progressive Denoising & Se
 
 .EXAMPLE
 .\scripts\run_experiment_v2.ps1 -PreparedRoot "D:\G4\prepared" -ProtocolDir "D:\G4\protocol" -Device "cuda"
-.\scripts\run_experiment_v2.ps1 -Stage "test" -PythonBin "C:\Users\skywalker\.conda\envs\temporal2seq-gpu\python.exe"
+.\scripts\run_experiment_v2.ps1 -Stage "test" -PythonBin "python"
 #>
 param(
     [string]$PreparedRoot = $env:PREPARED_ROOT,
     [string]$ProtocolDir = $env:PROTOCOL_DIR,
     [string]$OutputRoot = "",
-    [string]$PythonBin = "C:\Users\skywalker\.conda\envs\temporal2seq-gpu\python.exe",
+    [string]$PythonBin = $(if ($env:PYTHON_BIN) { $env:PYTHON_BIN } else { "python" }),
     [string]$Device = "cuda",
     [int]$Epochs = 10,
     [int]$BatchSize = 32,
     [double]$Lr = 0.001,
     [int[]]$Seeds = @(20261028, 20261029, 20261030),
-    [int]$AblSeed = 20261028,
+    [int]$AblSeed = $Seeds[0],
+    [int]$SplitSeed = $(if ($env:SPLIT_SEED) { [int]$env:SPLIT_SEED } else { 20261028 }),
     [ValidateSet("all", "test", "main", "abl1_synergy", "abl2_gate", "abl3_replay_unroll", "abl4_horizon_prog", "abl5_memory_reanchor", "paired_val")]
     [string]$Stage = "all",
     [int]$MaxRecordsPerEpoch = 0,
@@ -32,7 +33,10 @@ if (Test-Path (Join-Path $RepoRoot "v6\v6")) {
     $V6Dir = $RepoRoot
 }
 if (-not $OutputRoot) { $OutputRoot = Join-Path $RepoRoot "runs\exp_v2" }
-if (-not (Test-Path $PythonBin)) { $PythonBin = "python" }
+function Invoke-ExperimentPython {
+    & $PythonBin @args
+    if ($LASTEXITCODE -ne 0) { throw "Python exited with code $LASTEXITCODE" }
+}
 
 Write-Host "======================================================================"
 Write-Host "[Model Plan V2: ASD-SC] Stage='$Stage' | Device='$Device' | Output='$OutputRoot'"
@@ -41,9 +45,7 @@ Write-Host "====================================================================
 if ($Stage -in @("all", "test")) {
     Write-Host "[V2][Stage 0] Running V2 unit tests..."
     Push-Location $V6Dir
-    & $PythonBin -s -m unittest discover -s tests -v
-    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "Unit tests failed" }
-    Pop-Location
+    try { Invoke-ExperimentPython -s -m unittest discover -s tests -v } finally { Pop-Location }
     if ($Stage -eq "test") { exit 0 }
 }
 
@@ -55,6 +57,7 @@ $CommonArgs = @(
     "--prepared-root", $PreparedRoot,
     "--protocol-dir", $ProtocolDir,
     "--device", $Device,
+    "--split-seed", "$SplitSeed",
     "--epochs", "$Epochs",
     "--batch-size", "$BatchSize",
     "--lr", "$Lr",
@@ -66,28 +69,27 @@ if ($Stage -in @("all", "main")) {
     foreach ($seed in $Seeds) {
         $runDir = "$OutputRoot\stage1_asd_sc_full\seed_$seed"
         Write-Host "[V2][Stage 1] Training Full ASD-SC | seed=$seed..."
-        & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
             --run-dir $runDir --ablation-mode full --horizons-sec "60,300" `
             --lambda-forecast 1.0 --lambda-prog 0.25 --lambda-good-harm 2.0 `
             --counterfactual-prob 0.25 --seed "$seed" --eval-split dev_select
-        if ($LASTEXITCODE -ne 0) { throw "ASD-SC main training failed" }
     }
 }
 
 if ($Stage -in @("all", "abl1_synergy")) {
     foreach ($mode in @("obs_only", "state_only")) {
-        & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
             --run-dir "$OutputRoot\abl1_synergy\${mode}_seed_$AblSeed" `
             --ablation-mode $mode --seed "$AblSeed" --eval-split dev_select
     }
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl1_synergy\no_counterfactual_seed_$AblSeed" `
         --ablation-mode full --counterfactual-prob 0.0 --seed "$AblSeed" --eval-split dev_select
 }
 
 if ($Stage -in @("all", "abl2_gate")) {
     foreach ($mode in @("fixed_g", "unconstrained_mlp6d", "no_quantile_aux")) {
-        & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
             --run-dir "$OutputRoot\abl2_gate\${mode}_seed_$AblSeed" `
             --ablation-mode $mode --seed "$AblSeed" --eval-split dev_select
     }
@@ -95,38 +97,38 @@ if ($Stage -in @("all", "abl2_gate")) {
 
 if ($Stage -in @("all", "abl3_replay_unroll")) {
     foreach ($seed in $Seeds) {
-        & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
             --run-dir "$OutputRoot\abl3_replay_unroll\static_1step\seed_$seed" `
             --ablation-mode full --no-dagger-replay --single-step-grad --seed "$seed" --eval-split dev_select
     }
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl3_replay_unroll\static_2step_seed_$AblSeed" `
         --ablation-mode full --no-dagger-replay --seed "$AblSeed" --eval-split dev_select
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl3_replay_unroll\dagger_1step_seed_$AblSeed" `
         --ablation-mode full --single-step-grad --seed "$AblSeed" --eval-split dev_select
 }
 
 if ($Stage -in @("all", "abl4_horizon_prog")) {
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\current_only_seed_$AblSeed" `
-        --ablation-mode full --horizons-sec "" --lambda-forecast 0.0 --seed "$AblSeed" --eval-split dev_select
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+        --ablation-mode full --horizons-sec= --lambda-forecast 0.0 --seed "$AblSeed" --eval-split dev_select
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\horizon_60s_only_seed_$AblSeed" `
         --ablation-mode full --horizons-sec "60" --lambda-forecast 1.0 --seed "$AblSeed" --eval-split dev_select
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\no_progressive_aux_seed_$AblSeed" `
         --ablation-mode full --lambda-prog 0.0 --seed "$AblSeed" --eval-split dev_select
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl4_horizon_prog\no_good_harm_penalty_seed_$AblSeed" `
         --ablation-mode full --lambda-good-harm 0.0 --seed "$AblSeed" --eval-split dev_select
 }
 
 if ($Stage -in @("all", "abl5_memory_reanchor")) {
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl5_memory_reanchor\local_only_seed_$AblSeed" `
         --ablation-mode no_pending_memory --disable-reanchor --seed "$AblSeed" --eval-split dev_select
-    & $PythonBin "$V6Dir\scripts\train_v2.py" @CommonArgs `
+    Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs `
         --run-dir "$OutputRoot\abl5_memory_reanchor\memory_no_reanchor_seed_$AblSeed" `
         --ablation-mode full --disable-reanchor --seed "$AblSeed" --eval-split dev_select
 }
@@ -135,21 +137,19 @@ if ($RunPairedVal -or ($Stage -eq "paired_val")) {
     Write-Host "[V2][Stage 7] Evaluating locked ASD-SC vs Static-1Step on historical VAL..."
     foreach ($seed in $Seeds) {
         $fullBest = "$OutputRoot\stage1_asd_sc_full\seed_$seed\best.pt"
-        if (Test-Path $fullBest) {
-            & $PythonBin "$V6Dir\scripts\validate_v2.py" `
-                --prepared-root $PreparedRoot --protocol-dir $ProtocolDir `
-                --run-dir "$OutputRoot\stage1_asd_sc_full\seed_$seed" `
-                --ablation-mode full --resume $fullBest --eval-split paired_val `
-                --device $Device --max-eval-records "$MaxEvalRecords"
-        }
+        if (-not (Test-Path -LiteralPath $fullBest -PathType Leaf)) { throw "Missing required checkpoint: $fullBest" }
+        Invoke-ExperimentPython "$V6Dir\scripts\validate_v2.py" `
+            --prepared-root $PreparedRoot --protocol-dir $ProtocolDir `
+            --run-dir "$OutputRoot\stage1_asd_sc_full\seed_$seed" `
+            --ablation-mode full --resume $fullBest --eval-split paired_val `
+            --split-seed $SplitSeed --device $Device --max-eval-records "$MaxEvalRecords"
         $statBest = "$OutputRoot\abl3_replay_unroll\static_1step\seed_$seed\best.pt"
-        if (Test-Path $statBest) {
-            & $PythonBin "$V6Dir\scripts\validate_v2.py" `
-                --prepared-root $PreparedRoot --protocol-dir $ProtocolDir `
-                --run-dir "$OutputRoot\abl3_replay_unroll\static_1step\seed_$seed" `
-                --ablation-mode full --resume $statBest --eval-split paired_val `
-                --device $Device --max-eval-records "$MaxEvalRecords"
-        }
+        if (-not (Test-Path -LiteralPath $statBest -PathType Leaf)) { throw "Missing required checkpoint: $statBest" }
+        Invoke-ExperimentPython "$V6Dir\scripts\validate_v2.py" `
+            --prepared-root $PreparedRoot --protocol-dir $ProtocolDir `
+            --run-dir "$OutputRoot\abl3_replay_unroll\static_1step\seed_$seed" `
+            --ablation-mode full --resume $statBest --eval-split paired_val `
+            --split-seed $SplitSeed --device $Device --max-eval-records "$MaxEvalRecords"
     }
 }
 

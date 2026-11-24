@@ -40,6 +40,7 @@ from .reprojection import (
     apply_local_msc_step,
     deadzone_gate_alpha,
     estimate_online_los_noise_floor,
+    geodesic_angle_rad,
     propagate_si_with_stm,
     reproject_causal_window_single,
     select_causal_keyframes,
@@ -499,9 +500,8 @@ class JFBRRefiner(nn.Module):
         if self.mode == "vel_only":
             pooled = h_f.mean(dim=0)
             raw_v = self.vel_head(torch.cat((pooled, summary), dim=-1)).to(dtype=dtype)
-            raw_norm = torch.linalg.vector_norm(raw_v)
-            unit_dir = raw_v / raw_norm.clamp_min(1.0e-12)
-            b_theta = torch.tanh(raw_norm) * unit_dir  # ||b_theta||_2 <= 1
+            # Smooth algebraic squashing: ||b_theta||_2 < 1 everywhere AND d(b_theta)/d(raw_v)|_0 = I_3
+            b_theta = raw_v / torch.sqrt(1.0 + (raw_v * raw_v).sum())
 
             excess_ang = torch.relu(med_ang_t - float(tau_rad))
             rho_bar = torch.median(rep.pred_ranges_m)
@@ -766,7 +766,7 @@ class V1OnlineFilter(nn.Module):
         refiner: ClassicalLMRefiner | JFBRRefiner | LTRLMRefiner,
         *,
         base_filter: nn.Module | None = None,
-        max_keyframes: int = 16,
+        max_keyframes: int | None = None,
         trigger_offsets_sec: Sequence[float] = (30.0, 150.0, 300.0),
         prior_gate: PriorProtectionGate | None = None,
         default_sigma_rad: float = 5.0e-4,
@@ -775,120 +775,97 @@ class V1OnlineFilter(nn.Module):
         super().__init__()
         self.refiner = refiner
         self.base_filter = base_filter
-        self.max_keyframes = int(max_keyframes)
+        self.max_keyframes = (
+            int(getattr(refiner, "max_keyframes", 16))
+            if max_keyframes is None
+            else int(max_keyframes)
+        )
         self.trigger_offsets_sec = tuple(float(x) for x in trigger_offsets_sec)
         self.prior_gate = prior_gate or PriorProtectionGate()
         self.default_sigma_rad = float(default_sigma_rad)
         self.c_tau = float(c_tau)
         self.ledger = ComputeLedger()
 
-    def forward_single_track(
-        self,
-        *,
-        initial_state_si: Tensor,
-        init_time_sec: float,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        station_ids: Tensor | None = None,
-        station_id_reliable: Tensor | None = None,
-        valid_mask: Tensor | None = None,
-        iod_last_time_sec: float | None = None,
-    ) -> tuple[Tensor, Tensor, dict[str, Any]]:
-        """Run causal online estimation across a single [T, ...] trajectory."""
-        device = initial_state_si.device
-        dtype = torch.float64
-        x0 = initial_state_si.to(device=device, dtype=dtype)
-        T = int(times_sec.shape[0])
-        t_cpu = times_sec.detach().to("cpu", dtype=dtype)
-        val_cpu = (
-            torch.ones((T,), dtype=torch.bool)
-            if valid_mask is None
-            else valid_mask.detach().to("cpu", dtype=torch.bool)
-        )
-        obs = observed_los.to(device=device, dtype=dtype)
-        stn = station_states_si.to(device=device, dtype=dtype)
-
+    def rollout_track(
+        self, *, initial_state_si: Tensor, init_time_sec: float, times_sec: Tensor,
+        observed_los: Tensor, station_states_si: Tensor, station_ids: Tensor | None = None,
+        station_id_reliable: Tensor | None = None, valid_mask: Tensor | None = None,
+        iod_last_time_sec: float | None = None, block_start_time_sec: float | None = None,
+        detach_feedback: bool = False,
+    ) -> dict[str, Any]:
+        """Apply backbone updates at arrivals and history corrections at their publication times."""
+        x0 = initial_state_si.to(torch.float64)
+        times = times_sec.detach().cpu().double()
+        valid = torch.ones_like(times, dtype=torch.bool) if valid_mask is None else valid_mask.detach().cpu().bool()
+        obs, stations = observed_los.to(x0), station_states_si.to(x0)
+        obs_cpu, stations_cpu = obs.detach().cpu(), stations.detach().cpu()
+        indices = valid.nonzero().flatten().tolist()
+        first_time = float(times[indices[0]]) if indices else float(init_time_sec)
         checkpoints, _ = build_macro_checkpoint_schedule(
-            t_cpu,
-            val_cpu,
-            init_time_sec=float(init_time_sec),
-            iod_last_time_sec=iod_last_time_sec,
-            block_offsets_sec=self.trigger_offsets_sec,
-            include_block2_primary_endpoint=False,
-        )
-        trigger_by_idx = {
-            cp.last_obs_idx: cp for cp in checkpoints if cp.last_obs_idx >= 0
-        }
+            times, valid, init_time_sec=init_time_sec, iod_last_time_sec=iod_last_time_sec,
+            block_offsets_sec=self.trigger_offsets_sec, block_start_time_sec=block_start_time_sec)
+        at_frame = {float(times[k]): k for k in indices}
+        at_checkpoint = {cp.eval_time_sec: cp for cp in checkpoints}
+        anchor, anchor_time = x0, float(init_time_sec)
+        priors = [torch.zeros_like(x0)] * len(times)
+        posts = priors.copy()
+        publications = []
+        accepted = 0
+        endpoint, endpoint_time = None, None
+        base_step = getattr(self.base_filter, "step", None)
+        base_propagate = getattr(self.base_filter, "propagate", None)
+        if self.base_filter is not None and not callable(base_step) and not callable(base_propagate):
+            raise TypeError("base_filter must provide step(previous_state, dt, los, station) or propagate(state, dt)")
 
-        curr_post = x0
-        curr_t = float(init_time_sec)
-        first_valid_t: float | None = None
-        priors_out: list[Tensor] = []
-        posts_out: list[Tensor] = []
-        accepted_triggers = 0
+        def noise_floor(k):
+            return estimate_online_los_noise_floor(
+                times, obs_cpu, station_ids, station_id_reliable, valid, up_to_idx=k,
+                c_tau=self.c_tau, default_sigma_rad=self.default_sigma_rad, station_states_si=stations_cpu)[0]
 
-        for k in range(T):
-            if not bool(val_cpu[k].item()):
-                priors_out.append(torch.zeros_like(x0))
-                posts_out.append(torch.zeros_like(x0))
-                continue
-            tk = float(t_cpu[k].item())
-            if first_valid_t is None:
-                first_valid_t = tk
-            dt = tk - curr_t
-            prior_k, _ = propagate_si_with_stm(
-                curr_post, dt, compute_stm=False, ledger=self.ledger
-            )
-            curr_t = tk
-            post_k = prior_k
+        for tm in sorted(at_frame.keys() | at_checkpoint.keys()):
+            dt = tm - anchor_time
+            if callable(base_propagate):
+                prior = base_propagate(anchor, dt)
+            else:
+                prior, _ = propagate_si_with_stm(anchor, dt, compute_stm=False, ledger=self.ledger)
+            post = prior
+            k = at_frame.get(tm)
+            cp = at_checkpoint.get(tm)
+            tau = None
+            if k is not None and callable(base_step):
+                tau = noise_floor(k)
+                angle = float(geodesic_angle_rad(prior[:3] - stations[k, :3], obs[k]).detach())
+                if not self.prior_gate.should_hold_prior(tm - first_time, angle, tau):
+                    post = base_step(anchor, dt, obs[k], stations[k])
+            if cp is not None:
+                last = cp.last_obs_idx
+                if cp.has_new_observations:
+                    idx, _ = select_causal_keyframes(
+                        times, valid, up_to_idx=last, prev_checkpoint_idx=cp.prev_last_obs_idx,
+                        max_keyframes=self.max_keyframes)
+                    if len(idx) >= 2:
+                        tau = noise_floor(last) if tau is None else tau
+                        # Station ephemeris at the publication time using the latest measured velocity.
+                        pos = stations[last, :3] + (tm - float(times[last])) * stations[last, 3:]
+                        step = self.refiner.refine_anchor(post, tm, pos, times[idx].to(x0),
+                                                          stations[idx], obs[idx], tau_rad=tau, ledger=self.ledger)
+                        post = step.posterior_state_si
+                        accepted += int(step.accepted)
+                    publications.append((cp, post))
+                if cp.is_block2_primary_endpoint:
+                    endpoint, endpoint_time = post, tm
+            if k is not None:
+                priors[k], posts[k] = prior, post
+            if cp is not None or callable(base_step):
+                anchor = post.detach() if detach_feedback else post
+                anchor_time = tm
+        return dict(prior_states_si=torch.stack(priors), posterior_states_si=torch.stack(posts),
+                    checkpoint_states=publications, accepted_triggers=accepted, ledger=self.ledger.as_dict(),
+                    block2_t30_state_si=endpoint, block2_t30_time_sec=endpoint_time)
 
-            if k in trigger_by_idx:
-                cp = trigger_by_idx[k]
-                tau_k, _, _ = estimate_online_los_noise_floor(
-                    t_cpu,
-                    obs.detach().cpu(),
-                    None if station_ids is None else station_ids.detach().cpu(),
-                    None if station_id_reliable is None else station_id_reliable.detach().cpu(),
-                    val_cpu,
-                    up_to_idx=k,
-                    c_tau=self.c_tau,
-                    default_sigma_rad=self.default_sigma_rad,
-                )
-                kf_idx, is_new = select_causal_keyframes(
-                    t_cpu,
-                    val_cpu,
-                    up_to_idx=k,
-                    prev_checkpoint_idx=cp.prev_last_obs_idx,
-                    max_keyframes=self.max_keyframes,
-                )
-                if kf_idx.size >= 2:
-                    kf_t = t_cpu[kf_idx].to(device=device, dtype=dtype)
-                    kf_s = stn[kf_idx]
-                    kf_u = obs[kf_idx]
-                    step_out = self.refiner.refine_anchor(
-                        prior_k,
-                        tk,
-                        stn[k, :3],
-                        kf_t,
-                        kf_s,
-                        kf_u,
-                        tau_rad=tau_k,
-                        ledger=self.ledger,
-                    )
-                    post_k = step_out.posterior_state_si
-                    if step_out.accepted:
-                        accepted_triggers += 1
-
-            curr_post = post_k
-            priors_out.append(prior_k)
-            posts_out.append(post_k)
-
-        return (
-            torch.stack(priors_out, dim=0),
-            torch.stack(posts_out, dim=0),
-            {"accepted_triggers": accepted_triggers, "ledger": self.ledger.as_dict()},
-        )
+    def forward_single_track(self, **kwargs) -> tuple[Tensor, Tensor, dict[str, Any]]:
+        result = self.rollout_track(**kwargs)
+        return result["prior_states_si"], result["posterior_states_si"], result
 
     def forward_filter_sequence(
         self,

@@ -86,9 +86,28 @@ Building directly on the frozen `Prepared` data loader and differentiable `float
   - `v6/data/splits.py` & `v6/eval_metrics.py`: `source_id`-isolated `train_fit / train_calib / dev_select` splits, macro-checkpoint & `Block 2 + 30 s` scheduling, 4-cadence + `source_id`-equal tables, fair prior-referenced good-orbit harm rates, and cluster-paired bootstrap 95% CIs.
 - **Model Plan V1 (`v6/models/v1_ltr_lm.py`, `v6/models/v1_fd_asf.py`, `v6/training_v1.py`)**:
   - Classical non-learned controls (`cl_gn1_pure`, `cl_gn1_matched`, `cl_window_lm`, `cl_full_prefix_wls`), Jacobian-free bounded refiners (`JF-BR-Vel`, `JF-BR-6D`), and learned trust-region preconditioned 1-step LM (`LTR-LM` with `joint_6d`, `schur_vel`, `lock_pos_vel`).
-  - Flagship `FD-ASF`: batch-invariant continuous-time Legendre tracklet encoder $(H_s, B_s)$, $2+4$ Lambert ($M=0$) & Attributable ambiguity charts with exact log-Jacobian volume, 4-layer Conditional RealNVP proposal trained on SNIS optimal forecast disagreement $q_k^\star \propto \pi_k\|\mathbf{h}_{k+1}-\bar{\mathbf{h}}_{k+1}\|_2$ with defensive mixing, incremental block likelihood SMC, and 3-condition dominance-gated publishing.
+  - Flagship `FD-ASF`: batch-invariant continuous-time Legendre tracklet encoder $(H_s, B_s)$, $2+4$ Lambert ($M=0$) & Attributable ambiguity charts with analytic Attributable and finite-difference Lambert volume factors, 4-layer Conditional RealNVP proposal trained on SNIS optimal forecast disagreement $q_k^\star \propto \pi_k\|\mathbf{h}_{k+1}-\bar{\mathbf{h}}_{k+1}\|_2$ with defensive mixing, prefix likelihood reweighting, and 3-condition dominance-gated publishing.
   - Entry points: `scripts/train_v1.py`, `scripts/validate_v1.py`.
 - **Model Plan V2 (`v6/models/v2_asd_sc.py`, `v6/training_v2.py`)**:
   - `ASD-SC`: progressive subspace bounded blind denoiser ($L=2$ microsteps, 0.5/0.9 directional log-error quantile head, deadzone $\chi_i$, bounded shrinkage $g_i \in [g_{\min}, 1]$), cross-gap thin-QR pending subspace transport $D^{-1}\Phi D V_p = QR$, $K_p$ conditional unlock & $E_a$ restricted writeback ($E_h^\top\Delta\mathbf{y}=0$), A/B/C causal re-anchoring, DAgger rollout buffer, 2-checkpoint cross-gap unrolling, $\{0, 60, 300\}\text{ s}$ multi-horizon risk, and switchable progressive step-increment supervision $T_\ell\mathbf{d}_\ell$.
   - Entry points: `scripts/train_v2.py`, `scripts/validate_v2.py`.
+
+## Diffusion filters for optical orbit estimation
+
+Use `scripts/train_diffusion.py` and `scripts/validate_diffusion.py` with the same frozen prepared root and protocol directory as the V1 and V2 trainers.
+
+| `--route` | Estimator |
+| --- | --- |
+| `a` | A cosine variance-preserving diffusion filter denoises the six-dimensional initialization error. Each reverse step uses a locally linearized angular likelihood and a denoiser vector–Jacobian product. TRAIN-fit sources calibrate the initial mean error and covariance. |
+| `b1` | A cosine flow-matching proposal samples range coordinates on an Attributable or Lambert chart. Its invertible substeps have explicit log-determinants. Importance weights include the angular likelihood, physical chart volume and proposal density. |
+| `b2` | A stochastic Gaussian reverse chain uses learned proposal drifts, intermediate angular potentials and ancestry-aware resampling. The terminal importance ratio targets the same feasible chart as B1. |
+
+```bash
+python scripts/train_diffusion.py --route b1 --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/b1 --K 4 --P 8
+python scripts/validate_diffusion.py --run-dir runs/b1 --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --eval-split dev_select
+```
+
+`--K` sets the number of artificial-time intervals and `--P` the particle count. Route A uses `--delta` for its covariance floor. `--B-los` optionally limits likelihood evaluations to a subset of observations. The selected checkpoint includes the route and source split. Validation defaults to `best.pt`, and training resumes from `last.pt`. Use `--eval-split paired_val` for a locked configuration.
+
+The Bash and PowerShell experiment runners provide `main`, `b1`, `b2` and `test` stages. `paired_val`, `paired_b1` and `paired_b2` validate saved Route A, B1 and B2 runs, respectively. The CPU tests include two-body synthetic tracks and temporary prepared data that exercise all three training and validation entry points.
 

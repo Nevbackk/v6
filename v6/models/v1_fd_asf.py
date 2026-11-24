@@ -32,18 +32,16 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from ..data.splits import ObservationBlock, parse_observation_blocks
+from ..data.splits import parse_observation_blocks
 from .batched_physics import DTYPE, MU_EARTH_M3_S2, state_scale
 from .normalization import EARTH_RADIUS_M, T_SCALE_S, V_SCALE_MPS
 from .recursive_filter import TrainingFilterOutput
 from .reprojection import (
     ComputeLedger,
     build_los_frame,
-    estimate_online_los_noise_floor,
     geodesic_angle_rad,
     propagate_si_with_stm,
     safe_sinc,
-    select_causal_keyframes,
     spherical_exp_map,
 )
 from .v1_ltr_lm import LTRLMRefiner
@@ -384,7 +382,7 @@ class LambertChart2Plus4:
                 logdets.append(fb_logdet[i])
                 used_lam.append(torch.tensor(False, device=device))
                 continue
-            # Central finite-difference 6x6 Jacobian of F_b for exact volume element
+            # Central finite-difference approximation to the six-dimensional volume element.
             cols: list[Tensor] = []
             jac_ok = True
             for d in range(6):
@@ -717,10 +715,11 @@ class DefensiveProposalMixture(nn.Module):
         device = context.device
         P = int(num_samples)
         if mode == "sobol_nonlearned":
-            sobol = torch.quasirandom.SobolEngine(dimension=2, scramble=True)
-            u01 = sobol.draw(P).to(device=device, dtype=torch.float64).clamp(1.0e-4, 1.0 - 1.0e-4)
-            z = math.sqrt(2.0) * self.phys_std * torch.erfinv(2.0 * u01 - 1.0)
-            branch = (torch.arange(P, device=device) % self.num_branches).to(torch.long)
+            sobol = torch.quasirandom.SobolEngine(dimension=3, scramble=True)
+            eps = torch.finfo(torch.float64).eps
+            u01 = sobol.draw(P, dtype=torch.float64).to(device).clamp(eps, 1.0-eps)
+            z = math.sqrt(2.0) * self.phys_std * torch.erfinv(2.0 * u01[:, :2]-1.0)
+            branch = (u01[:, 2] * self.num_branches).long()
             return z, branch, self._log_q_phys(z)
 
         n_phys = max(1, int(round(self.eps_def * P)))
@@ -737,7 +736,17 @@ class DefensiveProposalMixture(nn.Module):
 
         z_all = torch.cat(parts_z, dim=0)
         b_all = torch.cat(parts_b, dim=0)
-        log_q_mix = self.log_prob(z_all, b_all, context).to(torch.float64)
+        # Use actual stratified balance-heuristic proportions (n_flow/P, n_phys/P) in the mixture denominator
+        eps_eff = float(n_phys) / float(P)
+        log_q_psi = self.flow.log_prob(z_all, b_all, context).to(torch.float64)
+        log_q_phy = self._log_q_phys(z_all).to(torch.float64)
+        if n_flow == 0:
+            log_q_mix = log_q_phy
+        else:
+            log_q_mix = torch.logaddexp(
+                math.log(1.0 - eps_eff) + log_q_psi,
+                math.log(eps_eff) + log_q_phy,
+            )
         return z_all, b_all, log_q_mix
 
 
@@ -748,18 +757,13 @@ def compute_forecast_disagreement_weights(
     t_ref_sec: float,
     next_view_time_sec: float,
     next_station_pos_si: Tensor,
-    num_spherical_bins: int = 16,
-    disagreement_floor: float = 1.0e-3,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Proposition 1 (FD-ASF): Optimal SNIS forecast-disagreement weights q_k* proportional to pi_k ||h - h_bar||_2.
+    """Zero-hyperparameter 3D spherical chord disagreement weights q_k* proportional to pi_k ||u_next - u_bar||_2.
 
     Uses ONLY causally known future platform geometry (next_view_time_sec, next_station_pos_si) —
-    NEVER reads any future LOS measurement u_{k+1}.
-
-    Returns:
-        w_star_norm: [M] normalized target weights for forward-KL flow training.
-        posterior_weights: [M] normalized standard posterior weights pi_k.
-        disagreement_norms: [M] ||h_{k+1}(theta_m) - h_bar_{k+1}||_2.
+    NEVER reads any future LOS measurement u_{k+1}. Leaves u_bar = E_{pi_k}[u_next] unnormalized so
+    orthogonal rotations preserve chord deviation and the trace of SNIS asymptotic variance for the
+    3D predictive mean is uniquely minimized by q* proportional to pi_k ||u_next - u_bar||_2.
     """
     M = int(candidate_thetas_si.shape[0])
     device, dtype = candidate_thetas_si.device, torch.float64
@@ -772,22 +776,17 @@ def compute_forecast_disagreement_weights(
     rel_next = x_next[:, :3] - next_station_pos_si[:3].to(device=device, dtype=dtype).unsqueeze(0)
     u_next = rel_next / torch.linalg.vector_norm(rel_next, dim=-1, keepdim=True).clamp_min(1.0)
 
-    # Bounded spherical harmonic / Fibonacci-bin soft forecast features h_{k+1}(theta) in R^B
-    B = int(num_spherical_bins)
-    idx = torch.arange(B, device=device, dtype=dtype)
-    phi_fib = math.pi * (3.0 - math.sqrt(5.0)) * idx
-    z_fib = 1.0 - 2.0 * (idx + 0.5) / float(B)
-    r_fib = torch.sqrt((1.0 - z_fib * z_fib).clamp_min(0.0))
-    anchors = torch.stack((r_fib * torch.cos(phi_fib), r_fib * torch.sin(phi_fib), z_fib), dim=-1)  # [B, 3]
+    # Unnormalized 3D predictive mean u_bar = E_{pi_k}[u_next] (exact zero-hyperparameter chord metric)
+    u_bar = (pi_w.unsqueeze(-1) * u_next).sum(dim=0, keepdim=True)  # [1, 3]
+    dis_norm = torch.linalg.vector_norm(u_next - u_bar, dim=-1)  # [M]
 
-    # Soft von Mises-Fisher bin assignment probabilities h(theta) in Delta^{B-1}
-    kappa_bin = 12.0
-    h_vecs = torch.softmax(kappa_bin * (u_next @ anchors.transpose(0, 1)), dim=-1)  # [M, B]
-    h_bar = (pi_w.unsqueeze(-1) * h_vecs).sum(dim=0, keepdim=True)  # [1, B]
-    dis_norm = torch.linalg.vector_norm(h_vecs - h_bar, dim=-1)  # [M]
-
-    raw_star = pi_w * (dis_norm + float(disagreement_floor))
-    w_star = raw_star / raw_star.sum().clamp_min(1.0e-15)
+    raw_star = pi_w * dis_norm
+    denom = raw_star.sum()
+    if float(denom.detach().item()) <= 1.0e-15:
+        # Degenerate zero-variance case: all branches predict identical LOS -> fall back cleanly to pi_k
+        w_star = pi_w
+    else:
+        w_star = raw_star / denom
     return w_star, pi_w, dis_norm
 
 
@@ -798,10 +797,10 @@ def proposal_weighted_kl_and_dsm_loss(
     target_weights: Tensor,
     context: Tensor,
     *,
-    dsm_weight: float = 0.05,
+    dsm_weight: float = 0.0,
     noise_scales: Sequence[float] = (0.05, 0.20),
 ) -> Tensor:
-    """Offline zero-BPTT training loss: weighted forward KL + optional geometry-aligned multi-scale DSM."""
+    """Offline zero-BPTT forward-KL loss for static RealNVP (dsm_weight defaults to 0.0; see diffusion_orbit.py for time-conditioned DSM)."""
     w = target_weights / target_weights.sum().clamp_min(1.0e-12)
     log_q = flow.log_prob(z_targets, branch_targets, context)
     kl_loss = -(w.detach() * log_q).sum()
@@ -875,7 +874,8 @@ class DominanceGatedPublisher:
             (particle_thetas_ref_si - best_mode.unsqueeze(0)) / scale.unsqueeze(0), dim=-1
         )
         in_basin = dists <= self.basin_radius_scaled
-        w_dom = float(particle_weights[in_basin].sum().item()) if bool(in_basin.any()) else float(particle_weights.max().item())
+        # Never borrow global max particle weight when the best mode's basin is empty!
+        w_dom = float(particle_weights[in_basin].sum().item()) if bool(in_basin.any()) else 0.0
         nll_gain = float(prior_nll - best_nll)
 
         cond1_above_noise = prior_median_angle_rad > float(tau_rad)
@@ -951,196 +951,95 @@ class FDASFSequentialFilter(nn.Module):
         return nll
 
     @torch.no_grad()
-    def forward_single_track(
-        self,
-        *,
-        initial_state_si: Tensor,
-        init_time_sec: float,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        valid_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, dict[str, Any]]:
-        """Run block-incremental FD-ASF SMC + Top-K LM + Dominance-Gated Publisher on one track."""
+    def rollout_track(
+        self, *, initial_state_si, init_time_sec, times_sec, observed_los, station_states_si,
+        valid_mask=None, block_start_time_sec=None, station_ids=None, station_id_reliable=None,
+        explicit_flush=False, readout_until_sec=None,
+    ) -> dict[str, Any]:
+        """Refresh or reweight reference-epoch particles at scheduled physical readouts."""
+        from ..data.observation_clock import causal_diffusion_events
+        from .orbit_proposals import build_chart_prefix, normal_log_density, prefix_nll, render_reference_orbits
+
         device = next(self.parameters()).device
-        dtype = torch.float64
-        t_ref = float(init_time_sec)
-        prior_theta_ref = initial_state_si.to(device=device, dtype=dtype)
-        published_theta_ref = prior_theta_ref.clone()
-
-        T = int(times_sec.shape[0])
-        t_cpu = times_sec.detach().to("cpu", dtype=dtype)
-        val_cpu = (
-            torch.ones((T,), dtype=torch.bool)
-            if valid_mask is None
-            else valid_mask.detach().to("cpu", dtype=torch.bool)
-        )
-        obs = observed_los.to(device=device, dtype=dtype)
-        stn = station_states_si.to(device=device, dtype=dtype)
-
-        blocks = parse_observation_blocks(t_cpu, val_cpu, init_time_sec=t_ref)
-        block_ends = {blk.end_idx: blk for blk in blocks}
-
-        particle_thetas: Tensor | None = None
-        particle_log_w: Tensor | None = None
-        prev_eval_idx = -1
-        switches = 0
-
-        priors_seq: list[Tensor] = []
-        posts_seq: list[Tensor] = []
-
-        for k in range(T):
-            if not bool(val_cpu[k].item()):
-                priors_seq.append(torch.zeros((6,), device=device, dtype=dtype))
-                posts_seq.append(torch.zeros((6,), device=device, dtype=dtype))
-                continue
-            tk = float(t_cpu[k].item())
-            prior_k, _ = propagate_si_with_stm(
-                published_theta_ref, tk - t_ref, compute_stm=False, ledger=self.ledger
-            )
-
-            if k in block_ends:
-                blk = block_ends[k]
-                tau_k, sigma_k, _ = estimate_online_los_noise_floor(
-                    t_cpu, obs.detach().cpu(), valid_mask=val_cpu, up_to_idx=k
-                )
-                kappa = 1.0 / max(sigma_k * sigma_k, 1.0e-8)
-                ctx, attr = self.tracklet_encoder.encode_prefix(
-                    t_cpu, obs, stn, val_cpu, up_to_idx=k, sigma_u_rad=sigma_k
-                )
-                if attr:
-                    attr_chart = AttributableChart2Plus4(
-                        t_c_sec=attr["t_c_sec"],
-                        t_ref_sec=t_ref,
-                        station_c_si=attr["station_c_si"],
-                        u_bar_c=attr["u_bar_c"],
-                        omega_bar_c=attr["omega_bar_c"],
-                    )
-                    if blk.block_index >= 1 and (attr["t_c_sec"] - attr["first_block_t_sec"]) >= 60.0:
-                        chart: Any = LambertChart2Plus4(
-                            t_a_sec=attr["first_block_t_sec"],
-                            t_b_sec=attr["t_c_sec"],
-                            t_ref_sec=t_ref,
-                            station_a_si=attr["first_station_si"],
-                            station_b_si=attr["station_c_si"],
-                            u_bar_a=attr["first_u_bar"],
-                            u_bar_b=attr["u_bar_c"],
-                            fallback_chart=attr_chart,
-                        )
+        initial = initial_state_si.to(device=device, dtype=torch.float64)
+        published = initial
+        times = times_sec.detach().cpu().double()
+        valid = torch.ones_like(times, dtype=torch.bool) if valid_mask is None else valid_mask.detach().cpu().bool()
+        obs, stations = observed_los.to(initial), station_states_si.to(initial)
+        record = dict(initial_state_si=initial, init_time_sec=init_time_sec, times_sec=times,
+                      observed_los=obs, station_states_si=stations, valid_mask=valid,
+                      station_ids=station_ids, station_id_reliable=station_id_reliable)
+        events = causal_diffusion_events(times, valid, init_time_sec, block_start_time_sec,
+                                        explicit_flush=explicit_flush, readout_until_sec=readout_until_sec)
+        anchors = []
+        particles = log_base = weights = None
+        endpoint = endpoint_time = None
+        previous, switches, attempted, failures = -1, 0, 0, 0
+        for at, k, is_endpoint in events:
+            if k > previous:
+                previous = k
+                pre = build_chart_prefix(self.tracklet_encoder, None, record, k, device=device, los_budget=16)
+                if weights is None or 1.0 / weights.square().sum() < self.num_particles / 2:
+                    attempted += 1
+                    z, branch, log_q = self.proposal.sample_and_log_prob(
+                        pre.context, self.num_particles, mode=self.proposal_mode)
+                    eta = torch.randn((len(z), 4), dtype=z.dtype, device=device) * pre.eta_std
+                    states, ld, in_chart = pre.decode(z, eta, branch, volume=True)
+                    proposal_base = ld - log_q - normal_log_density(eta, pre.eta_std)
+                    supported = in_chart & check_bound_perigee_feasible(states) & torch.isfinite(proposal_base)
+                    if bool(supported.any()):
+                        particles, log_base = states[supported], proposal_base[supported]
                     else:
-                        chart = attr_chart
-
-                    # Incremental observations in new block (never double-counting old blocks!)
-                    new_sl = slice(max(0, prev_eval_idx + 1), k + 1)
-                    new_mask = val_cpu[new_sl]
-                    new_idx_local = torch.nonzero(new_mask, as_tuple=False).squeeze(-1)
-                    # Subsample up to 8 evaluation epochs per block for fast incremental likelihood
-                    if new_idx_local.numel() > 8:
-                        sel = torch.linspace(0, new_idx_local.numel() - 1, 8).round().to(torch.long)
-                        new_idx_local = new_idx_local[sel]
-                    seg_t = t_cpu[new_sl][new_idx_local].to(device=device)
-                    seg_s = stn[new_sl][new_idx_local]
-                    seg_u = obs[new_sl][new_idx_local]
-
-                    need_refresh = particle_thetas is None
-                    if particle_log_w is not None:
-                        w_tmp = torch.softmax(particle_log_w - particle_log_w.max(), dim=0)
-                        ess = 1.0 / (w_tmp * w_tmp).sum().item()
-                        if ess < 0.5 * self.num_particles:
-                            need_refresh = True
-
-                    if need_refresh:
-                        z_s, b_s, log_q = self.proposal.sample_and_log_prob(
-                            ctx, self.num_particles, mode=self.proposal_mode
-                        )
-                        eta_s = torch.randn((self.num_particles, 4), device=device, dtype=dtype) * sigma_k
-                        log_q_eta = -0.5 * (
-                            (eta_s / sigma_k).square().sum(dim=-1) + 4.0 * math.log(2.0 * math.pi * sigma_k * sigma_k)
-                        )
-                        if isinstance(chart, LambertChart2Plus4):
-                            th_s, log_det, _ = chart.decode(z_s, eta_s, b_s)
-                        else:
-                            th_s, log_det = chart.decode(z_s, eta_s)
-
-                        kf_idx, _ = select_causal_keyframes(t_cpu, val_cpu, up_to_idx=k, max_keyframes=16)
-                        kf_t = t_cpu[kf_idx].to(device=device)
-                        kf_s = stn[kf_idx]
-                        kf_u = obs[kf_idx]
-                        full_nll = self._segment_nll(th_s, t_ref, kf_t, kf_s, kf_u, kappa)
-                        feasible = check_bound_perigee_feasible(th_s)
-                        log_phys = torch.where(feasible, torch.zeros_like(full_nll), torch.full_like(full_nll, -1.0e6))
-                        particle_thetas = th_s
-                        particle_log_w = log_phys - full_nll + log_det - (log_q + log_q_eta)
+                        failures += 1
+                if particles is not None:
+                    # Both refreshed and retained particles see the same prefix and noise calibration.
+                    log_w = log_base - prefix_nll(particles, pre, record)
+                    finite = torch.isfinite(log_w)
+                    if bool(finite.any()):
+                        particles, log_base = particles[finite], log_base[finite]
+                        weights = torch.softmax(log_w[finite], dim=0)
+                        idx = pre.indices
+                        if len(idx) >= 2:
+                            kf_t, kf_s, kf_u = times[idx].to(initial), stations[idx], obs[idx]
+                            top = weights.topk(min(self.top_k_polish, len(weights))).indices
+                            modes = []
+                            pos = stations[k, :3] + (at-float(times[k])) * stations[k, 3:]
+                            for candidate in particles[top]:
+                                state, _ = propagate_si_with_stm(candidate, at-init_time_sec, compute_stm=False)
+                                for _ in range(self.lm_polish_steps):
+                                    result = self.lm_refiner.refine_anchor(
+                                        state, at, pos, kf_t, kf_s, kf_u, tau_rad=3*pre.sigma, ledger=self.ledger)
+                                    state = result.posterior_state_si
+                                state_ref, _ = propagate_si_with_stm(state, init_time_sec-at, compute_stm=False)
+                                if bool(check_bound_perigee_feasible(state_ref.unsqueeze(0))[0]):
+                                    modes.append(state_ref)
+                            if modes:
+                                modes = torch.stack(modes)
+                                angles = []
+                                for t, station, los in zip(kf_t, kf_s, kf_u):
+                                    state, _ = propagate_si_with_stm(published, float(t)-init_time_sec, compute_stm=False)
+                                    angles.append(geodesic_angle_rad(state[:3]-station[:3], los))
+                                decision = self.publisher.select_published_orbit(
+                                    prior_theta_ref_si=published, prior_median_angle_rad=float(torch.stack(angles).median()),
+                                    tau_rad=3*pre.sigma, prior_nll=float(prefix_nll(published[None], pre, record)[0]),
+                                    polished_modes_theta_ref_si=modes, polished_modes_nll=prefix_nll(modes, pre, record),
+                                    particle_thetas_ref_si=particles, particle_weights=weights)
+                                published = decision.published_theta_ref_si
+                                switches += int(decision.switched_from_prior)
                     else:
-                        assert particle_thetas is not None and particle_log_w is not None
-                        delta_nll = self._segment_nll(particle_thetas, t_ref, seg_t, seg_s, seg_u, kappa)
-                        particle_log_w = particle_log_w - delta_nll
+                        particles = log_base = weights = None
+                anchors.append((at, published))
+            if is_endpoint:
+                endpoint, _ = propagate_si_with_stm(published, at-init_time_sec, compute_stm=False)
+                endpoint_time = at
+        priors, posts = render_reference_orbits(initial, init_time_sec, times, valid, anchors)
+        return dict(prior_states_si=priors, posterior_states_si=posts, switches=switches,
+                    ledger=self.ledger.as_dict(), failed_proposals=failures, attempted_batches=attempted,
+                    block2_t30_state_si=endpoint, block2_t30_time_sec=endpoint_time)
 
-                    prev_eval_idx = k
-                    w_norm = torch.softmax(particle_log_w - particle_log_w.max(), dim=0)
-
-                    # Polish Top-K modes using 6x6 LTR-LM kernel (strictly in point-publish pool!)
-                    kf_idx, _ = select_causal_keyframes(t_cpu, val_cpu, up_to_idx=k, max_keyframes=16)
-                    if kf_idx.size >= 2:
-                        kf_t = t_cpu[kf_idx].to(device=device)
-                        kf_s = stn[kf_idx]
-                        kf_u = obs[kf_idx]
-                        top_k = min(self.top_k_polish, self.num_particles)
-                        top_indices = torch.topk(w_norm, k=top_k).indices
-                        polished_list: list[Tensor] = []
-                        for idx_p in top_indices.tolist():
-                            cand_k, _ = propagate_si_with_stm(
-                                particle_thetas[idx_p], tk - t_ref, compute_stm=False, ledger=self.ledger
-                            )
-                            for _ in range(self.lm_polish_steps):
-                                out_lm = self.lm_refiner.refine_anchor(
-                                    cand_k, tk, stn[k, :3], kf_t, kf_s, kf_u, tau_rad=tau_k, ledger=self.ledger
-                                )
-                                cand_k = out_lm.posterior_state_si
-                            cand_ref, _ = propagate_si_with_stm(
-                                cand_k, t_ref - tk, compute_stm=False, ledger=self.ledger
-                            )
-                            polished_list.append(cand_ref)
-                        polished_modes = torch.stack(polished_list, dim=0)
-                        modes_nll = self._segment_nll(polished_modes, t_ref, kf_t, kf_s, kf_u, kappa)
-                        prior_nll = float(
-                            self._segment_nll(published_theta_ref.unsqueeze(0), t_ref, kf_t, kf_s, kf_u, kappa)[0].item()
-                        )
-                        # Compute prior median angle on keyframes
-                        angles_prior = []
-                        for j_w in range(int(kf_t.shape[0])):
-                            xj_p, _ = propagate_si_with_stm(
-                                published_theta_ref, float(kf_t[j_w].item()) - t_ref, compute_stm=False, ledger=self.ledger
-                            )
-                            u_p = xj_p[:3] - kf_s[j_w, :3]
-                            angles_prior.append(geodesic_angle_rad(u_p, kf_u[j_w]))
-                        prior_med = float(torch.median(torch.stack(angles_prior)).item())
-
-                        decision = self.publisher.select_published_orbit(
-                            prior_theta_ref_si=published_theta_ref,
-                            prior_median_angle_rad=prior_med,
-                            tau_rad=tau_k,
-                            prior_nll=prior_nll,
-                            polished_modes_theta_ref_si=polished_modes,
-                            polished_modes_nll=modes_nll,
-                            particle_thetas_ref_si=particle_thetas,
-                            particle_weights=w_norm,
-                        )
-                        published_theta_ref = decision.published_theta_ref_si
-                        if decision.switched_from_prior:
-                            switches += 1
-
-            post_k, _ = propagate_si_with_stm(
-                published_theta_ref, tk - t_ref, compute_stm=False, ledger=self.ledger
-            )
-            priors_seq.append(prior_k)
-            posts_seq.append(post_k)
-
-        return (
-            torch.stack(priors_seq, dim=0),
-            torch.stack(posts_seq, dim=0),
-            {"switches": switches, "ledger": self.ledger.as_dict()},
-        )
+    def forward_single_track(self, **kwargs) -> tuple[Tensor, Tensor, dict[str, Any]]:
+        result = self.rollout_track(**kwargs)
+        return result["prior_states_si"], result["posterior_states_si"], result
 
     def forward_filter_sequence(
         self,

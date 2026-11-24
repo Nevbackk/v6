@@ -31,12 +31,17 @@ class RecordEvalRow:
     pos_rmse_km: float
     vel_rmse_mps: float
     scaled_mse: float
-    block6_end_vel_rmse_mps: float
-    block6_end_radial_pos_km: float
+    block6_end_vel_rmse_mps: float | None
+    block6_end_radial_pos_km: float | None
     is_finite: bool
     diverged: bool
     prior_pos_rmse_km: float | None = None
     block2_t30_forecast300_pos_km: float | None = None
+    valid_frames: int = 0
+    eligible_prior_epochs: int = 0
+    newly_harmed_epochs: int = 0
+    failed_proposals: int = 0
+    attempted_batches: int = 0
 
 
 def compute_los_local_errors(
@@ -168,25 +173,15 @@ def summarize_record_rows(
         pos = np.array([r.pos_rmse_km if r.is_finite else np.inf for r in subset], dtype=np.float64)
         vel = np.array([r.vel_rmse_mps if r.is_finite else np.inf for r in subset], dtype=np.float64)
         smse = np.array([r.scaled_mse if r.is_finite else np.inf for r in subset], dtype=np.float64)
-        b6_v = np.array([r.block6_end_vel_rmse_mps if r.is_finite else np.inf for r in subset], dtype=np.float64)
-        b6_r = np.array([abs(r.block6_end_radial_pos_km) if r.is_finite else np.inf for r in subset], dtype=np.float64)
+        sixth = [r for r in subset if r.block6_end_vel_rmse_mps is not None]
+        b6_v = np.array([r.block6_end_vel_rmse_mps for r in sixth], dtype=np.float64)
+        b6_r = np.array([abs(r.block6_end_radial_pos_km) for r in sixth], dtype=np.float64)
         nonfinite_rate = float(np.mean([not r.is_finite for r in subset]))
         diverged_rate = float(np.mean([r.diverged or (not r.is_finite) for r in subset]))
 
-        # Good-orbit new harm rate strictly relative to un-updated propagated prior at same epoch
-        good_sub = [r for r in subset if 0.0 <= r.b0_pos_error_km < 10.0 and r.prior_pos_rmse_km is not None]
-        if good_sub:
-            newly_harmed = [
-                (not r.is_finite)
-                or (
-                    r.prior_pos_rmse_km <= good_orbit_harm_threshold_km
-                    and r.pos_rmse_km > good_orbit_harm_threshold_km
-                )
-                for r in good_sub
-            ]
-            good_harm_rate = float(np.mean(newly_harmed))
-        else:
-            good_harm_rate = 0.0
+        good_sub = [r for r in subset if 0.0 <= r.b0_pos_error_km < 10.0]
+        eligible = sum(r.eligible_prior_epochs for r in good_sub)
+        harmed = sum(r.newly_harmed_epochs for r in good_sub)
 
         b2_vals = np.array(
             [
@@ -203,10 +198,19 @@ def summarize_record_rows(
             "scaled_mse_finite_mean": float(np.mean(smse[np.isfinite(smse)])) if np.isfinite(smse).any() else float("inf"),
             "position_km": _distribution_summary(pos, cap_for_diverged=max(divergence_pos_km * 10.0, 10000.0)),
             "velocity_mps": _distribution_summary(vel, cap_for_diverged=10000.0),
-            "block6_end_vel_mps": _distribution_summary(b6_v, cap_for_diverged=10000.0),
-            "block6_end_radial_pos_km": _distribution_summary(b6_r, cap_for_diverged=10000.0),
-            "good_orbit_lt10km_new_harm_rate": good_harm_rate,
+            "block6_count": len(sixth),
+            "block6_end_vel_mps": _distribution_summary(b6_v, cap_for_diverged=10000.0) if sixth else None,
+            "block6_end_radial_pos_km": _distribution_summary(b6_r, cap_for_diverged=10000.0) if sixth else None,
+            "good_orbit_lt10km_new_harm_rate": harmed / eligible if eligible else None,
+            "good_orbit_eligible_epochs": eligible,
+            "good_orbit_new_harm_epochs": harmed,
+            "block2_endpoint_count": int(b2_vals.size),
+            "attempted_proposal_batches": sum(r.attempted_batches for r in subset),
+            "failed_proposal_batches": sum(r.failed_proposals for r in subset),
         }
+        frames = sum(r.valid_frames for r in subset)
+        if frames:
+            out["scaled_mse_pooled"] = sum(r.scaled_mse*r.valid_frames for r in subset if r.valid_frames) / frames
         if b2_vals.size > 0:
             out["v2_primary_block2_t30_forecast300_pos_km"] = _distribution_summary(
                 b2_vals, cap_for_diverged=10000.0

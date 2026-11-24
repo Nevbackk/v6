@@ -204,6 +204,7 @@ def build_macro_checkpoint_schedule(
     nominal_block_sec: float = 300.0,
     nominal_gap_sec: float = 300.0,
     include_block2_primary_endpoint: bool = True,
+    block_start_time_sec: float | None = None,
 ) -> tuple[list[MacroCheckpoint], list[ObservationBlock]]:
     """Build causal macro-checkpoints (+30s, +150s, +300s per block, <=18 total).
 
@@ -231,83 +232,36 @@ def build_macro_checkpoint_schedule(
     if not blocks:
         return [], []
 
-    checkpoints: list[MacroCheckpoint] = []
-    prev_obs_idx = -1
-    prev_block_idx = -1
-
-    for blk in blocks:
-        blk_base = blk.start_time_sec
+    # Events are published on their physical clock. Appending an observation
+    # never snaps a previously scheduled correction back to the last exposure.
+    until = float(valid_times[-1])
+    raw = {}
+    if block_start_time_sec is not None:
+        start = float(block_start_time_sec)
+        period = nominal_block_sec + nominal_gap_sec
+        starts = [(i, start+i*period, until) for i in range(max(0, int((until-start)//period)+1))]
+    else:
+        starts = [(b.block_index, b.start_time_sec,
+                   blocks[i+1].start_time_sec if i+1 < len(blocks) else until)
+                  for i,b in enumerate(blocks)]
+    for bi, start, stop in starts:
         for offset in block_offsets_sec:
-            target_t = min(blk_base + float(offset), max(blk.end_time_sec, blk_base + float(offset)))
-            # Snap to block end if offset >= nominal_block_sec and block ended slightly earlier
-            if float(offset) >= nominal_block_sec - 1e-6:
-                target_t = max(blk.end_time_sec, blk_base)
-            elif target_t > blk.end_time_sec and float(offset) > 35.0:
-                continue
-            if target_t < earliest_allowed - 1e-9:
-                continue
-
-            pos = int(np.searchsorted(valid_times, target_t + 1e-9, side="right")) - 1
-            last_idx = int(valid_indices[pos]) if pos >= 0 else -1
-            is_b2_ep = (blk.block_index == 1) and (abs(float(offset) - 30.0) < 1e-6)
-            if last_idx <= prev_obs_idx and not is_b2_ep:
-                continue
-
-            crossed = (prev_block_idx >= 0) and (blk.block_index > prev_block_idx)
-            checkpoints.append(
-                MacroCheckpoint(
-                    checkpoint_index=len(checkpoints),
-                    block_index=blk.block_index,
-                    target_offset_sec=float(offset),
-                    eval_time_sec=float(target_t),
-                    last_obs_idx=last_idx,
-                    prev_last_obs_idx=prev_obs_idx,
-                    crossed_gap=crossed,
-                    is_block2_primary_endpoint=is_b2_ep,
-                )
-            )
-            if last_idx > prev_obs_idx:
-                prev_obs_idx = last_idx
-            prev_block_idx = blk.block_index
-
-    # If a sparse track had only 1 block before Block 2 or missed Block 2 + 30 s,
-    # insert the nominal Block 2 + 30 s physical readout when requested and within track horizon.
-    if include_block2_primary_endpoint and not any(c.is_block2_primary_endpoint for c in checkpoints):
-        b0_start = blocks[0].start_time_sec
-        b2_start = blocks[1].start_time_sec if len(blocks) > 1 else (b0_start + nominal_block_sec + nominal_gap_sec)
-        b2_t30 = b2_start + 30.0
-        if b2_t30 >= earliest_allowed and valid_times.size > 0 and b2_t30 <= float(valid_times[-1]) + nominal_gap_sec:
-            # Insert in chronological order and rebuild indices cleanly
-            raw_specs = [
-                (c.block_index, c.target_offset_sec, c.eval_time_sec, c.is_block2_primary_endpoint)
-                for c in checkpoints
-            ]
-            raw_specs.append((1, 30.0, b2_t30, True))
-            raw_specs.sort(key=lambda item: item[2])
-            rebuilt: list[MacroCheckpoint] = []
-            p_obs = -1
-            p_blk = -1
-            for b_idx, off, ev_t, is_ep in raw_specs:
-                pos = int(np.searchsorted(valid_times, ev_t + 1e-9, side="right")) - 1
-                l_idx = int(valid_indices[pos]) if pos >= 0 else -1
-                crossed = (p_blk >= 0) and (b_idx > p_blk)
-                rebuilt.append(
-                    MacroCheckpoint(
-                        checkpoint_index=len(rebuilt),
-                        block_index=b_idx,
-                        target_offset_sec=off,
-                        eval_time_sec=ev_t,
-                        last_obs_idx=l_idx,
-                        prev_last_obs_idx=p_obs,
-                        crossed_gap=crossed,
-                        is_block2_primary_endpoint=is_ep,
-                    )
-                )
-                if l_idx > p_obs:
-                    p_obs = l_idx
-                p_blk = b_idx
-            checkpoints = rebuilt
-
+            at = start + float(offset)
+            if earliest_allowed <= at <= min(until, stop):
+                raw[at] = (bi, float(offset), False)
+    endpoint = float(init_time_sec if block_start_time_sec is None else block_start_time_sec) + nominal_block_sec + nominal_gap_sec + 30.
+    if include_block2_primary_endpoint and earliest_allowed <= endpoint <= until:
+        raw[endpoint] = (1, 30., True)
+    checkpoints = []
+    previous, previous_block = -1, -1
+    for at,(bi,offset,endpoint_flag) in sorted(raw.items()):
+        pos = int(np.searchsorted(valid_times, at, side="right")) - 1
+        last = int(valid_indices[pos]) if pos >= 0 else -1
+        if last <= previous and not endpoint_flag:
+            continue
+        checkpoints.append(MacroCheckpoint(len(checkpoints), bi, offset, at, last, previous,
+                                           previous_block >= 0 and bi > previous_block, endpoint_flag))
+        previous, previous_block = last, bi
     return checkpoints, blocks
 
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -29,6 +29,7 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
+from .checkpoints import read_checkpoint, restore_training_state, save_epoch
 from .data.splits import (
     MacroCheckpoint,
     build_macro_checkpoint_schedule,
@@ -216,8 +217,12 @@ def compute_v2_checkpoint_loss(
             )
 
         l_quant = torch.zeros_like(e_m)
-        if weights.lambda_quantile > 0.0 and tr.V_phys.numel() > 0:
+        if weights.lambda_quantile > 0.0 and tr.q50_pred.numel() > 0:
             proj_abs = (tr.V_phys.detach().transpose(0, 1) @ d_rem).abs()
+            for group in tr.groups:
+                if len(group) > 1:
+                    idx = list(group)
+                    proj_abs[idx] = proj_abs[idx].square().mean().sqrt()
             z_star = torch.log(float(weights.eps_0) + proj_abs).detach()
             l_quant = pinball_loss(z_star, tr.q50_pred, 0.5) + pinball_loss(z_star, tr.q90_pred, 0.9)
 
@@ -310,6 +315,7 @@ class RolloutPairSample:
     memory_m: PendingSubspaceMemory
     cp_m: MacroCheckpoint
     cp_next: MacroCheckpoint | None
+    switched_state_si: Tensor | None = None
 
 
 class DAggerRolloutBuffer:
@@ -321,6 +327,15 @@ class DAggerRolloutBuffer:
 
     def __len__(self) -> int:
         return len(self.samples)
+
+    def load_samples(self, entries):
+        self.samples = [RolloutPairSample(
+            record_key=row["record_key"], prior_m_si=row["prior_m_si"],
+            memory_m=PendingSubspaceMemory(**row["memory_m"]),
+            cp_m=MacroCheckpoint(**row["cp_m"]),
+            cp_next=None if row["cp_next"] is None else MacroCheckpoint(**row["cp_next"]),
+            switched_state_si=row.get("switched_state_si"),
+        ) for row in entries]
 
     @torch.no_grad()
     def collect_from_records(
@@ -373,21 +388,25 @@ class DAggerRolloutBuffer:
                         observed_los=obs,
                         station_states_si=stn,
                         valid_mask=valid,
+                        block_start_time_sec=rec.get("block_start_time_sec"),
+                        iod_last_time_sec=rec.get("iod_last_time_sec"),
+                        station_ids=rec.get("station_ids"),
+                        station_id_reliable=rec.get("station_id_reliable"),
                     )
                     cps = res["checkpoint_records"]
                     if not cps:
                         continue
-                    prev_mem = PendingSubspaceMemory.empty(torch.device("cpu"), torch.float64)
                     for i, entry in enumerate(cps):
                         cp_m: MacroCheckpoint = entry["checkpoint"]
                         if not cp_m.has_new_observations:
-                            prev_mem = entry["memory"]
                             continue
                         cp_n = cps[i + 1]["checkpoint"] if (two_step_pairs and i + 1 < len(cps)) else None
+                        # Use QR-transported memory_in at cp_m's exact entry epoch!
+                        mem_in = entry.get("memory_in", entry["memory"])
                         mem_cpu = PendingSubspaceMemory(
-                            V_p=prev_mem.V_p.detach().cpu(),
-                            r_diag_log=prev_mem.r_diag_log.detach().cpu(),
-                            r_mix_ratio=prev_mem.r_mix_ratio,
+                            V_p=mem_in.V_p.detach().cpu(),
+                            r_diag_log=mem_in.r_diag_log.detach().cpu(),
+                            r_mix_ratio=mem_in.r_mix_ratio,
                         )
                         self.samples.append(
                             RolloutPairSample(
@@ -396,13 +415,17 @@ class DAggerRolloutBuffer:
                                 memory_m=mem_cpu,
                                 cp_m=cp_m,
                                 cp_next=cp_n,
+                                switched_state_si=(entry["published_state_si"].detach().cpu()
+                                                   if entry.get("reanchor_applied", False) else None),
                             )
                         )
-                        prev_mem = entry["memory"]
                         added += 1
                 else:
                     # V2-Abl-3 static B0 baseline: pure un-updated propagation without learner feedback
-                    checkpoints, _ = build_macro_checkpoint_schedule(times, valid, init_time_sec=t_init)
+                    checkpoints, _ = build_macro_checkpoint_schedule(
+                        times, valid, init_time_sec=t_init, block_offsets_sec=model.block_offsets_sec,
+                        block_start_time_sec=rec.get("block_start_time_sec"),
+                        iod_last_time_sec=rec.get("iod_last_time_sec"))
                     curr_p = x0_cand
                     curr_tp = t_init
                     empty_mem = PendingSubspaceMemory.empty(torch.device("cpu"), torch.float64)
@@ -481,6 +504,8 @@ def train_two_checkpoint_pair(
         prev_last_obs_idx=sample.cp_m.prev_last_obs_idx,
         memory_in=mem_m,
         has_new_observations=sample.cp_m.has_new_observations,
+        station_ids=record.get("station_ids"),
+        station_id_reliable=record.get("station_id_reliable"),
     )
     truth_1 = _truth_at_time(times, truth, valid, sample.cp_m.eval_time_sec)
     loss_1, stats_1 = compute_v2_checkpoint_loss(out_1, truth_1, weights=loss_weights)
@@ -489,16 +514,20 @@ def train_two_checkpoint_pair(
         return loss_1, stats_1
 
     dt_gap = sample.cp_next.eval_time_sec - sample.cp_m.eval_time_sec
+    # A selected A-segment candidate is a discrete replay branch. Its published
+    # B-time state differs from the new candidate proposed at B.
+    pub_state_1 = (out_1.published_state_si if sample.switched_state_si is None
+                   else sample.switched_state_si.to(device=dev, dtype=dtype).detach())
+    memory = (out_1.memory_out if sample.switched_state_si is None
+              else PendingSubspaceMemory.empty(dev, dtype))
     prior_2, phi_gap = propagate_si_with_stm(
-        out_1.local_posterior_si,
+        pub_state_1,
         dt_gap,
-        compute_stm=(out_1.memory_out.dim_p > 0),
+        compute_stm=(memory.dim_p > 0),
         ledger=model.ledger,
     )
     mem_2 = (
-        transport_pending_subspace_qr(out_1.memory_out, phi_gap)
-        if (out_1.memory_out.dim_p > 0 and phi_gap is not None)
-        else out_1.memory_out
+        transport_pending_subspace_qr(memory, phi_gap) if phi_gap is not None else memory
     )
 
     out_2 = model.run_checkpoint(
@@ -512,6 +541,8 @@ def train_two_checkpoint_pair(
         prev_last_obs_idx=sample.cp_next.prev_last_obs_idx,
         memory_in=mem_2,
         has_new_observations=sample.cp_next.has_new_observations,
+        station_ids=record.get("station_ids"),
+        station_id_reliable=record.get("station_id_reliable"),
     )
     truth_2 = _truth_at_time(times, truth, valid, sample.cp_next.eval_time_sec)
     loss_2, stats_2 = compute_v2_checkpoint_loss(out_2, truth_2, weights=loss_weights)
@@ -550,10 +581,18 @@ def main(evaluation: bool = False) -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1.0e-3)
-    parser.add_argument("--seed", type=int, default=20261028)
+    parser.add_argument("--seed", type=int, default=20261028, help="Model/training RNG seed")
+    parser.add_argument("--split-seed", type=int, default=20261028, help="Frozen source_id split seed")
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
 
+    if not evaluation and args.eval_split == "paired_val":
+        parser.error("Training/model selection MUST use --eval-split dev_select; reserve paired_val for locked validation only.")
+
+    config_keys = ("ablation_mode", "disable_reanchor", "single_step_grad", "no_dagger_replay",
+                   "counterfactual_prob", "horizons_sec", "lambda_prog", "lambda_forecast",
+                   "lambda_good_harm", "seed", "split_seed")
+    ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -564,10 +603,8 @@ def main(evaluation: bool = False) -> None:
         enable_reanchor=(not args.disable_reanchor),
     ).to(args.device)
     last_ckpt = args.run_dir / "last.pt"
-    src_ckpt = args.resume or (last_ckpt if last_ckpt.exists() else None)
     start_epoch = 1
-    if src_ckpt and src_ckpt.exists():
-        ckpt = torch.load(src_ckpt, map_location="cpu", weights_only=True)
+    if ckpt:
         model.load_state_dict(ckpt["model"], strict=True)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
 
@@ -576,15 +613,15 @@ def main(evaluation: bool = False) -> None:
         eval_keys = sorted(eval_prep.rows)
     else:
         eval_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
-        eval_keys = partition_prepared_keys_by_source(eval_prep.rows, seed=args.seed)["dev_select"]
+        eval_keys = partition_prepared_keys_by_source(eval_prep.rows, seed=args.split_seed)["dev_select"]
     if args.max_eval_records > 0:
         eval_keys = eval_keys[: args.max_eval_records]
 
     def _pack_eval(prep: Prepared, keys: Sequence[str]):
-        return [
+        return (
             (k, str(prep.rows[k]["record_key"]["source_id"]), str(prep.rows[k]["record_key"]["rhythm"]), prep.record(k))
             for k in keys
-        ]
+        )
 
     if evaluation:
         res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
@@ -593,7 +630,7 @@ def main(evaluation: bool = False) -> None:
         return
 
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
-    fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.seed)["train_fit"]
+    fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     h_vals, h_weights = _parse_horizons(args.horizons_sec)
     loss_weights = V2LossWeights(
@@ -601,10 +638,16 @@ def main(evaluation: bool = False) -> None:
         horizon_weights=h_weights,
         lambda_prog=args.lambda_prog,
         lambda_forecast=args.lambda_forecast if h_vals else 0.0,
+        lambda_quantile=0.0 if args.ablation_mode == "no_quantile_aux" else 0.05,
         lambda_good_harm=args.lambda_good_harm,
     )
     buffer = DAggerRolloutBuffer(max_pairs=32768)
-    best_ep = float("inf")
+    buffer.load_samples(ckpt.get("replay", []))
+    def selection_score(summary):
+        overall = summary["overall"]
+        return float(overall.get("v2_primary_block2_t30_forecast300_pos_km",
+                                 overall["position_km"])["capped_mean"])
+    best_ep = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
         rng = random.Random(args.seed + 101 * epoch)
@@ -649,6 +692,8 @@ def main(evaluation: bool = False) -> None:
                     )
                     losses.append(lp)
                 loss = torch.stack(losses).mean()
+                if not loss.requires_grad:
+                    continue
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
@@ -665,23 +710,11 @@ def main(evaluation: bool = False) -> None:
                     flush=True,
                 )
 
-        payload = {
-            "model": model.state_dict(),
-            "epoch": epoch,
-            "ablation_mode": args.ablation_mode,
-            "seed": args.seed,
-        }
-        torch.save(payload, args.run_dir / f"v2_epoch_{epoch:02d}.pt")
-        torch.save(payload, last_ckpt)
         val_res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
         (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(json.dumps(val_res["summary"], indent=2) + "\n")
-        overall = val_res["summary"]["overall"]
-        score = float(
-            overall.get("v2_primary_block2_t30_forecast300_pos_km", overall["position_km"])["capped_mean"]
-        )
-        if score <= best_ep:
-            best_ep = score
-            torch.save(payload, args.run_dir / "best.pt")
+        best_ep = save_epoch(args.run_dir / f"v2_epoch_{epoch:02d}.pt", last_ckpt, model, optimizer,
+                             args, config_keys, epoch, selection_score(val_res["summary"]), best_ep,
+                             replay=[asdict(smp) for smp in buffer.samples])
 
 
 __all__ = [

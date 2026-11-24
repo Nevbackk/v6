@@ -35,13 +35,17 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-0.001}"
 SEEDS_STR="${SEEDS:-20261028 20261029 20261030}"
-ABL_SEED="${ABL_SEED:-20261028}"
 STAGE="${STAGE:-all}"
 MAX_RECORDS_PER_EPOCH="${MAX_RECORDS_PER_EPOCH:-0}"
 MAX_EVAL_RECORDS="${MAX_EVAL_RECORDS:-0}"
 RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"
 
 read -r -a SEEDS_ARR <<< "${SEEDS_STR}"
+case "${STAGE}" in
+  all|test|main|abl1_synergy|abl2_gate|abl3_replay_unroll|abl4_horizon_prog|abl5_memory_reanchor|paired_val) ;;
+  *) echo "Unknown stage: ${STAGE}" >&2; exit 2 ;;
+esac
+ABL_SEED="${ABL_SEED:-${SEEDS_ARR[0]}}"
 
 echo "======================================================================"
 echo "[Model Plan V2: ASD-SC] Starting Stage='${STAGE}' | Device='${DEVICE}'"
@@ -67,6 +71,7 @@ COMMON_ARGS=(
   --prepared-root "${PREPARED_ROOT}"
   --protocol-dir "${PROTOCOL_DIR}"
   --device "${DEVICE}"
+  --split-seed "${SPLIT_SEED:-20261028}"
   --epochs "${EPOCHS}"
   --batch-size "${BATCH_SIZE}"
   --lr "${LR}"
@@ -244,30 +249,28 @@ if [[ "${RUN_PAIRED_VAL}" == "1" || "${STAGE}" == "paired_val" ]]; then
   echo "[V2][Stage 7] Evaluating locked ASD-SC vs Static-1Step on historical VAL..."
   for SEED in "${SEEDS_ARR[@]}"; do
     FULL_DIR="${OUTPUT_ROOT}/stage1_asd_sc_full/seed_${SEED}"
-    if [[ -f "${FULL_DIR}/best.pt" ]]; then
-      "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" \
-        --prepared-root "${PREPARED_ROOT}" \
-        --protocol-dir "${PROTOCOL_DIR}" \
-        --run-dir "${FULL_DIR}" \
-        --ablation-mode full \
-        --resume "${FULL_DIR}/best.pt" \
-        --eval-split paired_val \
-        --device "${DEVICE}" \
-        --max-eval-records "${MAX_EVAL_RECORDS}"
-    fi
+    [[ -f "${FULL_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${FULL_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" \
+      --prepared-root "${PREPARED_ROOT}" \
+      --protocol-dir "${PROTOCOL_DIR}" \
+      --run-dir "${FULL_DIR}" \
+      --ablation-mode full \
+      --resume "${FULL_DIR}/best.pt" \
+      --eval-split paired_val \
+      --device "${DEVICE}" --split-seed "${SPLIT_SEED:-20261028}" \
+      --max-eval-records "${MAX_EVAL_RECORDS}"
 
     STAT_DIR="${OUTPUT_ROOT}/abl3_replay_unroll/static_1step/seed_${SEED}"
-    if [[ -f "${STAT_DIR}/best.pt" ]]; then
-      "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" \
-        --prepared-root "${PREPARED_ROOT}" \
-        --protocol-dir "${PROTOCOL_DIR}" \
-        --run-dir "${STAT_DIR}" \
-        --ablation-mode full \
-        --resume "${STAT_DIR}/best.pt" \
-        --eval-split paired_val \
-        --device "${DEVICE}" \
-        --max-eval-records "${MAX_EVAL_RECORDS}"
-    fi
+    [[ -f "${STAT_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${STAT_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" \
+      --prepared-root "${PREPARED_ROOT}" \
+      --protocol-dir "${PROTOCOL_DIR}" \
+      --run-dir "${STAT_DIR}" \
+      --ablation-mode full \
+      --resume "${STAT_DIR}/best.pt" \
+      --eval-split paired_val \
+      --device "${DEVICE}" --split-seed "${SPLIT_SEED:-20261028}" \
+      --max-eval-records "${MAX_EVAL_RECORDS}"
   done
 fi
 

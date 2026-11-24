@@ -21,10 +21,8 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
-from .data.splits import (
-    build_macro_checkpoint_schedule,
-    partition_prepared_keys_by_source,
-)
+from .checkpoints import read_checkpoint, restore_training_state, save_epoch
+from .data.splits import partition_prepared_keys_by_source
 from .eval_metrics import (
     RecordEvalRow,
     compute_los_local_errors,
@@ -32,16 +30,9 @@ from .eval_metrics import (
     summarize_record_rows,
 )
 from .models.batched_physics import state_scale
-from .models.reprojection import (
-    estimate_online_los_noise_floor,
-    propagate_si_with_stm,
-    select_causal_keyframes,
-)
+from .models.reprojection import propagate_si_with_stm
 from .models.v1_fd_asf import (
-    AttributableChart2Plus4,
     FDASFSequentialFilter,
-    check_bound_perigee_feasible,
-    compute_forecast_disagreement_weights,
     proposal_weighted_kl_and_dsm_loss,
 )
 from .models.v1_ltr_lm import (
@@ -123,45 +114,18 @@ def train_v1_refiner_step_on_record(
         record.get("valid_mask", torch.ones(times.shape[0], dtype=torch.bool)), dtype=torch.bool
     )
 
-    checkpoints, _ = build_macro_checkpoint_schedule(
-        times, valid, init_time_sec=t_init, include_block2_primary_endpoint=False
-    )
-    active_cps = [cp for cp in checkpoints if cp.last_obs_idx >= 1]
-    if not active_cps:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
-
-    losses: list[Tensor] = []
-    curr_x = x0
-    curr_t = t_init
-
-    for cp in active_cps:
+    rollout = model.rollout_track(
+        initial_state_si=x0, init_time_sec=t_init, times_sec=times, observed_los=obs,
+        station_states_si=stn, valid_mask=valid, block_start_time_sec=record.get("block_start_time_sec"),
+        iod_last_time_sec=record.get("iod_last_time_sec"), station_ids=record.get("station_ids"),
+        station_id_reliable=record.get("station_id_reliable"), detach_feedback=True)
+    losses = []
+    for cp, published in rollout["checkpoint_states"]:
         k = cp.last_obs_idx
-        tk = float(times[k].item())
-        prior_k, _ = propagate_si_with_stm(curr_x.detach(), tk - curr_t, compute_stm=False)
-        tau_k, _, _ = estimate_online_los_noise_floor(
-            times, obs.detach().cpu(), valid_mask=valid, up_to_idx=k
-        )
-        kf_idx, _ = select_causal_keyframes(
-            times, valid, up_to_idx=k, prev_checkpoint_idx=cp.prev_last_obs_idx, max_keyframes=model.max_keyframes
-        )
-        if kf_idx.size < 2:
-            curr_x, curr_t = prior_k.detach(), tk
-            continue
-        out = model.refiner.refine_anchor(
-            prior_k,
-            tk,
-            stn[k, :3],
-            times[kf_idx].to(device=dev, dtype=dtype),
-            stn[kf_idx],
-            obs[kf_idx],
-            tau_rad=tau_k,
-        )
-        losses.append(state_regression_loss(out.posterior_state_si, truth[k], loss_type=loss_type))
-        curr_x = out.posterior_state_si.detach()
-        curr_t = tk
-
+        target, _ = propagate_si_with_stm(truth[k], cp.eval_time_sec - float(times[k]), compute_stm=False)
+        losses.append(state_regression_loss(published, target, loss_type=loss_type))
     if not losses:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
+        return x0.new_zeros((), requires_grad=True)
     return torch.stack(losses).mean()
 
 
@@ -175,94 +139,15 @@ def train_fd_asf_proposal_step_on_record(
     device: torch.device | str = "cpu",
 ) -> Tensor:
     """Zero-BPTT offline amortized proposal training step for FD-ASF (or Posterior-CNF when False)."""
-    dev = torch.device(device)
-    dtype = torch.float64
-    t_init = float(record["init_time_sec"])
-    times = torch.as_tensor(record["times_sec"], dtype=dtype)
-    obs = torch.as_tensor(record["observed_los"], device=dev, dtype=dtype)
-    stn = torch.as_tensor(record["station_states_si"], device=dev, dtype=dtype)
-    truth = torch.as_tensor(record["truth_states_si"], device=dev, dtype=dtype)
-    valid = torch.as_tensor(
-        record.get("valid_mask", torch.ones(times.shape[0], dtype=torch.bool)), dtype=torch.bool
-    )
-
-    _, blocks = build_macro_checkpoint_schedule(
-        times, valid, init_time_sec=t_init, include_block2_primary_endpoint=False
-    )
-    if not blocks:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
-
-    blk0 = blocks[0]
-    k_end = blk0.end_idx
-    _, sigma_k, _ = estimate_online_los_noise_floor(
-        times, obs.detach().cpu(), valid_mask=valid, up_to_idx=k_end
-    )
-    ctx, attr = model.tracklet_encoder.encode_prefix(
-        times, obs, stn, valid, up_to_idx=k_end, sigma_u_rad=sigma_k
-    )
-    if not attr:
-        return torch.zeros((), device=dev, dtype=dtype, requires_grad=True)
-
-    t_c = attr["t_c_sec"]
-    k_mid = (blk0.start_idx + blk0.end_idx) // 2
-    truth_c, _ = propagate_si_with_stm(truth[k_mid], t_c - float(times[k_mid].item()), compute_stm=False)
-    rel_r_star = truth_c[:3] - attr["station_c_si"][:3]
-    rel_v_star = truth_c[3:] - attr["station_c_si"][3:]
-    rho_star = torch.linalg.vector_norm(rel_r_star).clamp_min(100.0)
-    rhodot_star = (rel_v_star * (rel_r_star / rho_star)).sum()
-
-    chart = AttributableChart2Plus4(
-        t_c_sec=t_c,
-        t_ref_sec=t_init,
-        station_c_si=attr["station_c_si"],
-        u_bar_c=attr["u_bar_c"],
-        omega_bar_c=attr["omega_bar_c"],
-    )
-    z_star = torch.stack(
-        (torch.log(rho_star / chart.rho_ref_m), rhodot_star / chart.v_ref_mps), dim=0
-    )
-
-    M = int(num_ref_candidates)
-    n_local = M // 2
-    z_local = z_star.unsqueeze(0) + torch.randn((n_local, 2), device=dev, dtype=dtype) * 0.15
-    z_wide = z_star.unsqueeze(0) + torch.randn((M - n_local, 2), device=dev, dtype=dtype) * 0.85
-    z_cand = torch.cat((z_local, z_wide), dim=0)
-    b_cand = torch.zeros((M,), device=dev, dtype=torch.long)
-
-    thetas_cand, log_det = chart.decode(z_cand)
-    kf_idx, _ = select_causal_keyframes(times, valid, up_to_idx=k_end, max_keyframes=12)
-    kappa = 1.0 / max(sigma_k * sigma_k, 1.0e-8)
-    nll = model._segment_nll(
-        thetas_cand,
-        t_init,
-        times[kf_idx].to(device=dev),
-        stn[kf_idx],
-        obs[kf_idx],
-        kappa,
-    )
-    feas = check_bound_perigee_feasible(thetas_cand)
-    log_pi = torch.where(feas, -nll + log_det, torch.full_like(nll, -1.0e6))
-
-    if len(blocks) >= 2:
-        next_idx = blocks[1].start_idx
-        t_next = float(times[next_idx].item())
-        s_next = stn[next_idx, :3]
-    else:
-        t_next = float(times[k_end].item()) + 300.0
-        s_next_full, _ = propagate_si_with_stm(stn[k_end], 300.0, compute_stm=False)
-        s_next = s_next_full[:3]
-
-    w_star, w_pi, _ = compute_forecast_disagreement_weights(
-        thetas_cand,
-        log_pi,
-        t_ref_sec=t_init,
-        next_view_time_sec=t_next,
-        next_station_pos_si=s_next,
-    )
-    target_w = w_star if use_forecast_disagreement else w_pi
+    from .models.orbit_proposals import EmptyTeacherSupport, draw_chart_teacher
+    try:
+        z, branch, _, w_star, w_pi, context = draw_chart_teacher(
+            model.tracklet_encoder, None, record, num_ref_candidates=num_ref_candidates,
+            device=device, los_budget=16)
+    except EmptyTeacherSupport:
+        return (next(model.parameters()) * 0.0).sum()
     return proposal_weighted_kl_and_dsm_loss(
-        model.flow, z_cand, b_cand, target_w, ctx, dsm_weight=dsm_weight
-    )
+        model.flow, z, branch, w_star if use_forecast_disagreement else w_pi, context, dsm_weight=dsm_weight)
 
 
 @torch.no_grad()
@@ -271,6 +156,7 @@ def evaluate_filter_records(
     records_with_meta: Sequence[tuple[str, str, str, Mapping[str, Any]]],
     *,
     device: torch.device | str = "cpu",
+    good_orbit_harm_threshold_km: float = 20.0,
 ) -> dict[str, Any]:
     """Evaluate a V1 or V2 sequence filter on (record_id, source_id, cadence, record) items."""
     dev = torch.device(device)
@@ -312,7 +198,14 @@ def evaluate_filter_records(
         )
 
         b2_ep_km: float | None = None
+        failed_batches = attempted_batches = 0
         if hasattr(model, "rollout_track"):
+            from inspect import Parameter, signature
+            parameters = signature(model.rollout_track).parameters
+            accepts_kwargs = any(p.kind is Parameter.VAR_KEYWORD for p in parameters.values())
+            metadata = {key: rec[key] for key in ("station_ids", "station_id_reliable", "block_start_time_sec",
+                                                   "readout_until_sec", "iod_last_time_sec", "initial_station_si")
+                        if key in rec and (accepts_kwargs or key in parameters)}
             roll = model.rollout_track(
                 initial_state_si=x0,
                 init_time_sec=t0,
@@ -320,8 +213,12 @@ def evaluate_filter_records(
                 observed_los=obs,
                 station_states_si=stn,
                 valid_mask=valid,
+                **metadata,
             )
             post_all = roll["posterior_states_si"]
+            prior_all = roll["prior_states_si"]
+            failed_batches = roll.get("failed_proposals", 0)
+            attempted_batches = roll.get("attempted_batches", 0)
             if roll["block2_t30_state_si"] is not None and roll["block2_t30_time_sec"] is not None:
                 t_ep = float(roll["block2_t30_time_sec"])
                 near_pos = int(torch.argmin((times[val_idx] - t_ep).abs()).item())
@@ -342,8 +239,13 @@ def evaluate_filter_records(
                 valid_mask=valid,
             )
             post_all = out.posterior_states_si
+            prior_all = out.prior_states_si
 
         post_valid = post_all[val_idx.to(dev)]
+        prior_errors = (prior_all[val_idx.to(dev), :3]-truth_valid[:, :3]).norm(dim=-1) / 1000.
+        post_errors = (post_valid[:, :3]-truth_valid[:, :3]).norm(dim=-1) / 1000.
+        eligible = prior_errors <= good_orbit_harm_threshold_km
+        harmful = eligible & ((post_errors > good_orbit_harm_threshold_km) | ~torch.isfinite(post_errors))
         is_fin = bool(torch.isfinite(post_valid).all().item())
         if is_fin:
             scale = state_scale(device=dev, dtype=torch.float64)
@@ -374,12 +276,17 @@ def evaluate_filter_records(
                 pos_rmse_km=pos_rmse,
                 vel_rmse_mps=vel_rmse,
                 scaled_mse=smse,
-                block6_end_vel_rmse_mps=b6_vel,
-                block6_end_radial_pos_km=b6_rad,
+                block6_end_vel_rmse_mps=b6_vel if times[last_k] >= rec.get("block_start_time_sec", t0)+3000. else None,
+                block6_end_radial_pos_km=b6_rad if times[last_k] >= rec.get("block_start_time_sec", t0)+3000. else None,
                 is_finite=is_fin,
                 diverged=(not is_fin) or (pos_rmse > 1000.0),
                 prior_pos_rmse_km=prior_pos_rmse_km,
                 block2_t30_forecast300_pos_km=b2_ep_km,
+                valid_frames=val_idx.numel(),
+                eligible_prior_epochs=int(eligible.sum()),
+                newly_harmed_epochs=int(harmful.sum()),
+                failed_proposals=failed_batches,
+                attempted_batches=attempted_batches,
             )
         )
 
@@ -410,7 +317,7 @@ def main(evaluation: bool = False) -> None:
     parser.add_argument("--jfbr-mode", default="homog_6d", choices=("vel_only", "homog_6d"))
     parser.add_argument("--loss-type", default="log_charbonnier", choices=V1_LOSS_TYPES)
     parser.add_argument("--num-particles", type=int, default=12)
-    parser.add_argument("--dsm-weight", type=float, default=0.05)
+    parser.add_argument("--dsm-weight", type=float, default=0.0)
     parser.add_argument("--eval-split", default="dev_select", choices=("dev_select", "paired_val"))
     parser.add_argument("--max-records-per-epoch", type=int, default=0, help="0 = full train_fit split")
     parser.add_argument("--max-eval-records", type=int, default=0, help="0 = full eval split")
@@ -418,10 +325,20 @@ def main(evaluation: bool = False) -> None:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1.0e-3)
-    parser.add_argument("--seed", type=int, default=20261028)
+    parser.add_argument("--seed", type=int, default=20261028, help="Model/training RNG seed")
+    parser.add_argument("--split-seed", type=int, default=20261028, help="Frozen source_id split seed")
     parser.add_argument("--resume", type=Path)
     args = parser.parse_args()
 
+    if not evaluation and args.eval_split == "paired_val":
+        parser.error("Training/model selection MUST use --eval-split dev_select; reserve paired_val for locked validation only.")
+
+    config_keys = ("arch", "writeback_mode", "jfbr_mode", "proposal_mode", "num_particles",
+                   "dsm_weight", "loss_type", "split_seed", "seed")
+    config_keys = tuple(key for key in config_keys if hasattr(args, key))
+    learned = not (args.arch.startswith("cl_") or args.arch == "sobol_lambert_lm")
+    ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys,
+                           eval_overrides=("num_particles",), require_weights=learned)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -435,10 +352,8 @@ def main(evaluation: bool = False) -> None:
         device=args.device,
     )
     last_ckpt = args.run_dir / "last.pt"
-    src_ckpt = args.resume or (last_ckpt if last_ckpt.exists() else None)
     start_epoch = 1
-    if src_ckpt and src_ckpt.exists():
-        ckpt = torch.load(src_ckpt, map_location="cpu", weights_only=True)
+    if ckpt:
         model.load_state_dict(ckpt["model"], strict=True)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
 
@@ -447,17 +362,17 @@ def main(evaluation: bool = False) -> None:
         eval_keys = sorted(eval_prep.rows)
     else:
         eval_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
-        eval_keys = partition_prepared_keys_by_source(eval_prep.rows, seed=args.seed)["dev_select"]
+        eval_keys = partition_prepared_keys_by_source(eval_prep.rows, seed=args.split_seed)["dev_select"]
     if args.max_eval_records > 0:
         eval_keys = eval_keys[: args.max_eval_records]
 
     def _pack_eval_items(prep: Prepared, keys: Sequence[str]):
-        return [
+        return (
             (k, str(prep.rows[k]["record_key"]["source_id"]), str(prep.rows[k]["record_key"]["rhythm"]), prep.record(k))
             for k in keys
-        ]
+        )
 
-    if evaluation or sum(p.numel() for p in model.parameters()) == 0:
+    if evaluation or not learned:
         res = evaluate_filter_records(model, _pack_eval_items(eval_prep, eval_keys), device=args.device)
         out_path = args.run_dir / f"eval_{args.eval_split}.json"
         out_path.write_text(json.dumps(res["summary"], indent=2) + "\n")
@@ -465,9 +380,11 @@ def main(evaluation: bool = False) -> None:
         return
 
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
-    fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.seed)["train_fit"]
+    fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
-    best_p95 = float("inf")
+    def selection_score(summary):
+        return float(summary["overall"]["position_km"]["p95"])
+    best_p95 = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -497,6 +414,8 @@ def main(evaluation: bool = False) -> None:
                     )
                 batch_losses.append(loss_k)
             loss = torch.stack(batch_losses).mean()
+            if not loss.requires_grad:
+                continue
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -512,15 +431,10 @@ def main(evaluation: bool = False) -> None:
                 flush=True,
             )
 
-        payload = {"model": model.state_dict(), "epoch": epoch, "arch": args.arch, "seed": args.seed}
-        torch.save(payload, args.run_dir / f"epoch_{epoch:02d}.pt")
-        torch.save(payload, last_ckpt)
         val_res = evaluate_filter_records(model, _pack_eval_items(eval_prep, eval_keys), device=args.device)
         (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(json.dumps(val_res["summary"], indent=2) + "\n")
-        curr_p95 = float(val_res["summary"]["overall"]["position_km"]["p95"])
-        if curr_p95 <= best_p95:
-            best_p95 = curr_p95
-            torch.save(payload, args.run_dir / "best.pt")
+        best_p95 = save_epoch(args.run_dir / f"epoch_{epoch:02d}.pt", last_ckpt, model, optimizer,
+                              args, config_keys, epoch, selection_score(val_res["summary"]), best_p95)
 
 
 __all__ = [

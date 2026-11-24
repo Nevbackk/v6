@@ -538,11 +538,12 @@ def estimate_online_los_noise_floor(
     valid_mask: Tensor | np.ndarray | None = None,
     *,
     up_to_idx: int,
-    dt_cal_max_sec: float = 25.0,
+    dt_cal_max_sec: float = 50.0,
     kappa_dist: float = 0.8493218002880191,  # 1 / sqrt(2 ln 2)
     c_tau: float = 3.0,
     n_min_triplets: int = 3,
     default_sigma_rad: float = 5.0e-4,
+    station_states_si: Tensor | np.ndarray | None = None,
 ) -> tuple[float, float, int]:
     """Causal unequal-time triplet interpolation angular noise-floor estimator (pois10-safe).
 
@@ -581,16 +582,21 @@ def estimate_online_los_noise_floor(
     span = t_next - t_prev
     good = (span > 1.0e-6) & (span <= float(dt_cal_max_sec)) & (t_mid > t_prev) & (t_next > t_mid)
 
-    if station_ids is not None and station_id_reliable is not None:
-        sids = np.asarray(station_ids).reshape(-1)[: up_to_idx + 1][idx]
-        srel = np.asarray(station_id_reliable, dtype=bool).reshape(-1)[: up_to_idx + 1][idx]
-        same_station = (
-            (~srel[:-2])
-            | (~srel[1:-1])
-            | (~srel[2:])
-            | ((sids[:-2] == sids[1:-1]) & (sids[1:-1] == sids[2:]))
-        )
-        good = good & same_station
+    same_pair = np.ones(idx.size - 1, dtype=bool)
+    if station_states_si is not None:
+        stations = torch.as_tensor(station_states_si).detach().cpu().numpy().reshape(-1, 6)[idx]
+        # A moving LEO platform travels kilometres between samples. Identify jumps
+        # relative to its measured velocity, not to a stationary observer.
+        dr = np.diff(stations[:, :3], axis=0)
+        predicted = .5*(stations[1:, 3:]+stations[:-1, 3:])*np.diff(t)[:, None]
+        same_pair = np.linalg.norm(dr-predicted, axis=1) < 100.
+    if station_ids is not None:
+        ids = torch.as_tensor(station_ids).detach().cpu().numpy().reshape(-1)[idx]
+        reliable = (np.ones(idx.size, dtype=bool) if station_id_reliable is None else
+                    torch.as_tensor(station_id_reliable).detach().cpu().numpy().reshape(-1)[idx].astype(bool))
+        trusted = reliable[1:] & reliable[:-1]
+        same_pair[trusted] = (ids[1:] == ids[:-1])[trusted]
+    good &= same_pair[:-1] & same_pair[1:]
 
     triplet_pos = np.flatnonzero(good)
     n_triplets = int(triplet_pos.size)

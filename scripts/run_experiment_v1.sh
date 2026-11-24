@@ -42,6 +42,10 @@ MAX_EVAL_RECORDS="${MAX_EVAL_RECORDS:-0}"
 RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"
 
 read -r -a SEEDS_ARR <<< "${SEEDS_STR}"
+case "${STAGE}" in
+  all|test|classical|abl_3x2|ltr_lm|fd_asf|paired_val) ;;
+  *) echo "Unknown stage: ${STAGE}" >&2; exit 2 ;;
+esac
 
 echo "======================================================================"
 echo "[Model Plan V1] Starting Stage='${STAGE}' | Device='${DEVICE}'"
@@ -67,6 +71,7 @@ COMMON_ARGS=(
   --prepared-root "${PREPARED_ROOT}"
   --protocol-dir "${PROTOCOL_DIR}"
   --device "${DEVICE}"
+  --split-seed "${SPLIT_SEED:-20261028}"
   --max-records-per-epoch "${MAX_RECORDS_PER_EPOCH}"
   --max-eval-records "${MAX_EVAL_RECORDS}"
 )
@@ -157,13 +162,13 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "fd_asf" ]]; then
   for ARCH in posterior_cnf fd_asf; do
     for SEED in "${SEEDS_ARR[@]}"; do
       RUN_DIR="${OUTPUT_ROOT}/stage4_flagship/${ARCH}_P12/seed_${SEED}"
-      echo "[V1][Stage 4] Training ${ARCH} (P=12, DSM=0.05) | seed=${SEED}..."
+      echo "[V1][Stage 4] Training ${ARCH} (P=12, DSM=0.0) | seed=${SEED}..."
       "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v1.py" \
         "${COMMON_ARGS[@]}" \
         --run-dir "${RUN_DIR}" \
         --arch "${ARCH}" \
         --num-particles 12 \
-        --dsm-weight 0.05 \
+        --dsm-weight 0.0 \
         --epochs "${EPOCHS}" \
         --batch-size "${BATCH_SIZE}" \
         --lr "${LR}" \
@@ -186,26 +191,24 @@ if [[ "${RUN_PAIRED_VAL}" == "1" || "${STAGE}" == "paired_val" ]]; then
 
   for SEED in "${SEEDS_ARR[@]}"; do
     LTR_DIR="${OUTPUT_ROOT}/stage3_ltr_lm/joint_6d/seed_${SEED}"
-    if [[ -f "${LTR_DIR}/best.pt" ]]; then
-      "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" \
-        "${COMMON_ARGS[@]}" \
-        --run-dir "${LTR_DIR}" \
-        --arch ltr_lm \
-        --writeback-mode joint_6d \
-        --resume "${LTR_DIR}/best.pt" \
-        --eval-split paired_val
-    fi
+    [[ -f "${LTR_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${LTR_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" \
+      "${COMMON_ARGS[@]}" \
+      --run-dir "${LTR_DIR}" \
+      --arch ltr_lm \
+      --writeback-mode joint_6d \
+      --resume "${LTR_DIR}/best.pt" \
+      --eval-split paired_val
 
     FD_DIR="${OUTPUT_ROOT}/stage4_flagship/fd_asf_P12/seed_${SEED}"
-    if [[ -f "${FD_DIR}/best.pt" ]]; then
-      "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" \
-        "${COMMON_ARGS[@]}" \
-        --run-dir "${FD_DIR}" \
-        --arch fd_asf \
-        --num-particles 12 \
-        --resume "${FD_DIR}/best.pt" \
-        --eval-split paired_val
-    fi
+    [[ -f "${FD_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${FD_DIR}/best.pt" >&2; exit 2; }
+    "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v1.py" \
+      "${COMMON_ARGS[@]}" \
+      --run-dir "${FD_DIR}" \
+      --arch fd_asf \
+      --num-particles 12 \
+      --resume "${FD_DIR}/best.pt" \
+      --eval-split paired_val
   done
 fi
 

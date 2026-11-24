@@ -24,6 +24,12 @@ from .v1_fd_asf import (AttributableChart2Plus4, LambertChart2Plus4,
 from .v2_asd_sc import (ASDSCFilter, SubspaceBlindDenoiserHead,
     CausalReanchorHead, PendingSubspaceMemory,
     transport_pending_subspace_qr, unlock_pending_directions_and_basis)
+from .diffusion_orbit import (CosineVPDenoiserNet, ReverseODETrace,
+    RouteBGuidedCosineFlow2D, RouteBTwistedDiffusionSMC,
+    VPOrbitDiffusionFilter, build_diagonal_los_prior_covariance,
+    compute_noisy_los_guidance_o6, integrate_vp_reverse_pf_ode,
+    propagate_reference_covariance_stm, regularized_carryover_covariance,
+    vp_velocity_moment_loss, whitened_reference_covariance_update)
 
 __all__ = [
     "FeatureBatch",
@@ -78,4 +84,16 @@ __all__ = [
     "PendingSubspaceMemory",
     "transport_pending_subspace_qr",
     "unlock_pending_directions_and_basis",
+    "CosineVPDenoiserNet",
+    "ReverseODETrace",
+    "RouteBGuidedCosineFlow2D",
+    "RouteBTwistedDiffusionSMC",
+    "VPOrbitDiffusionFilter",
+    "build_diagonal_los_prior_covariance",
+    "compute_noisy_los_guidance_o6",
+    "integrate_vp_reverse_pf_ode",
+    "propagate_reference_covariance_stm",
+    "regularized_carryover_covariance",
+    "vp_velocity_moment_loss",
+    "whitened_reference_covariance_update",
 ]
