@@ -21,6 +21,7 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
+from .eval_metrics import metrics_json
 from .checkpoints import read_checkpoint, restore_training_state, save_epoch
 from .data.splits import partition_prepared_keys_by_source
 from .eval_metrics import (
@@ -206,49 +207,94 @@ def evaluate_filter_records(
         )
 
         observation_nll = None
+        posterior_nll = affine_nll = None
+        hpd90 = cone90 = los_error = None
+        failure = None
+        roll = None
         failed_batches = attempted_batches = 0
-        if hasattr(model, "rollout_track"):
-            from inspect import Parameter, signature
-            parameters = signature(model.rollout_track).parameters
-            accepts_kwargs = any(p.kind is Parameter.VAR_KEYWORD for p in parameters.values())
-            metadata = {
-                key: rec[key]
-                for key in ("station_ids", "station_id_reliable", "initial_station_si")
-                if key in rec and (accepts_kwargs or key in parameters)
-            }
-            roll = model.rollout_track(
-                initial_state_si=x0,
-                init_time_sec=t0,
-                times_sec=times,
-                observed_los=obs,
-                station_states_si=stn,
-                valid_mask=valid,
-                **metadata,
-            )
-            post_all = roll["posterior_states_si"]
-            prior_all = roll["prior_states_si"]
-            failed_batches = roll.get("failed_proposals", 0)
-            attempted_batches = roll.get("attempted_batches", 0)
-            if "observation_nll" in roll:
-                observation_nll = float(roll["observation_nll"][val_idx.to(dev)].mean())
-        else:
-            out = model.forward_filter_sequence(
-                initial_state_si=x0,
-                init_time_sec=t0,
-                times_sec=times,
-                observed_los=obs,
-                station_states_si=stn,
-                valid_mask=valid,
-            )
-            post_all = out.posterior_states_si
-            prior_all = out.prior_states_si
+        try:
+            if hasattr(model, "rollout_track"):
+                from inspect import Parameter, signature
 
+                parameters = signature(model.rollout_track).parameters
+                accepts_kwargs = any(p.kind is Parameter.VAR_KEYWORD for p in parameters.values())
+                metadata = {
+                    key: rec[key]
+                    for key in ("station_ids", "station_id_reliable", "initial_station_si")
+                    if key in rec and (accepts_kwargs or key in parameters)
+                }
+                if "score_states_si" in parameters:
+                    metadata["score_states_si"] = truth
+                roll = model.rollout_track(
+                    initial_state_si=x0,
+                    init_time_sec=t0,
+                    times_sec=times,
+                    observed_los=obs,
+                    station_states_si=stn,
+                    valid_mask=valid,
+                    **metadata,
+                )
+                post_all = roll["posterior_states_si"]
+                prior_all = roll["prior_states_si"]
+                failed_batches = roll.get("failed_proposals", 0)
+                attempted_batches = roll.get("attempted_batches", 0)
+                if "observation_nll" in roll:
+                    observation_nll = float(roll["observation_nll"][val_idx.to(dev)].mean())
+                if roll.get("posterior_nll_si") is not None:
+                    posterior_nll = float(roll["posterior_nll_si"][val_idx.to(dev)].mean())
+                    affine_nll = float(roll["reference_nll_si"][val_idx.to(dev)].mean())
+                    hpd90 = float(roll["posterior_hpd90"][val_idx.to(dev)].mean())
+                    measured_error = roll["los_error_rad"][val_idx.to(dev)]
+                    cone90 = float(
+                        (measured_error <= roll["los_cone90_rad"][val_idx.to(dev)]).double().mean()
+                    )
+                    los_error = float(measured_error.mean())
+            else:
+                out = model.forward_filter_sequence(
+                    initial_state_si=x0,
+                    init_time_sec=t0,
+                    times_sec=times,
+                    observed_los=obs,
+                    station_states_si=stn,
+                    valid_mask=valid,
+                )
+                post_all = out.posterior_states_si
+                prior_all = out.prior_states_si
+        except (FloatingPointError, torch.linalg.LinAlgError, OverflowError) as error:
+            failure = dict(
+                type=getattr(error, "cause_type", type(error).__name__),
+                message=str(error),
+                frame=getattr(error, "frame_index", None),
+                time_sec=getattr(error, "time_sec", None),
+            )
+            prior_all = post_all = torch.full_like(truth, float("nan"))
         post_valid = post_all[val_idx.to(dev)]
         prior_errors = (prior_all[val_idx.to(dev), :3]-truth_valid[:, :3]).norm(dim=-1) / 1000.
         post_errors = (post_valid[:, :3]-truth_valid[:, :3]).norm(dim=-1) / 1000.
         eligible = prior_errors <= good_orbit_harm_threshold_km
         harmful = eligible & ((post_errors > good_orbit_harm_threshold_km) | ~torch.isfinite(post_errors))
-        is_fin = bool(torch.isfinite(post_valid).all().item())
+        finite_frames = torch.isfinite(post_valid).all(-1) & torch.isfinite(prior_all[val_idx.to(dev)]).all(
+            -1
+        )
+        if roll is not None and failure is None:
+            for field in ("observation_nll", "posterior_nll_si"):
+                if roll.get(field) is not None:
+                    finite_frames &= torch.isfinite(roll[field][val_idx.to(dev)])
+        is_fin = bool(finite_frames.all())
+        if not is_fin and failure is None:
+            bad = int(val_idx[(~finite_frames).nonzero()[0, 0].cpu()])
+            failure = dict(
+                type="NonFiniteOutput",
+                message="Non-finite state or predictive score",
+                frame=bad,
+                time_sec=float(times[bad]),
+            )
+        if failure is not None and hasattr(model, "estimator"):
+            # Keep failed density estimators in accuracy, coverage and NLL denominators.
+            posterior_nll = affine_nll = observation_nll = los_error = float("inf")
+            hpd90 = cone90 = 0.0
+        elif failure is not None and hasattr(model, "sensor"):
+            observation_nll = float("inf")
         if is_fin:
             scale = state_scale(device=dev, dtype=torch.float64)
             smse = float(((post_valid - truth_valid) / scale).square().mean().item())
@@ -284,6 +330,13 @@ def evaluate_filter_records(
                 diverged=(not is_fin) or (pos_rmse > 1000.0),
                 prior_pos_rmse_km=prior_pos_rmse_km,
                 observation_nll=observation_nll,
+                posterior_nll_si=posterior_nll,
+                reference_nll_si=affine_nll,
+                initialization=rec.get("initialization", "supplied"),
+                failure=failure,
+                posterior_hpd90_rate=hpd90,
+                los_cone90_rate=cone90,
+                los_error_rad=los_error,
                 valid_frames=val_idx.numel(),
                 eligible_prior_epochs=int(eligible.sum()),
                 newly_harmed_epochs=int(harmful.sum()),
@@ -298,9 +351,10 @@ def evaluate_filter_records(
 
 
 def diffusion_entry(version, evaluation):
-    """The versioned entry points default to the shared per-frame diffusion model."""
+    """Select the per-frame estimator from the command line or its saved checkpoint."""
     selector = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     selector.add_argument("--arch")
+    selector.add_argument("--route")
     selector.add_argument("--ablation-mode")
     selector.add_argument("--resume", type=Path)
     selector.add_argument("--run-dir", type=Path)
@@ -313,10 +367,12 @@ def diffusion_entry(version, evaluation):
         if path.exists():
             saved = torch.load(path, map_location="cpu", weights_only=True)
             arch = saved.get("arch", "asd_sc" if "ablation_mode" in saved else "diffusion")
-    if arch in (None, "diffusion"):
+    if arch is None:
+        arch = "ppc" if version == "v2" and chosen.route is None else "diffusion"
+    if arch in ("ppc", "qr", "gaussian", "diffusion"):
         from .training_diffusion import main as run_diffusion
 
-        run_diffusion(evaluation, version=version)
+        run_diffusion(evaluation, version=version, default_arch=arch)
         return True
     return False
 
@@ -344,6 +400,12 @@ def main(evaluation: bool = False) -> None:
         ),
     )
     parser.add_argument("--writeback-mode", default="joint_6d", choices=("joint_6d", "schur_vel", "lock_pos_vel"))
+    parser.add_argument(
+        "--initialization",
+        choices=("known_state", "gauss_ls"),
+        default="known_state",
+        help="Use gauss_ls to compare classical controls with V2 on identical B0",
+    )
     parser.add_argument("--jfbr-mode", default="homog_6d", choices=("vel_only", "homog_6d"))
     parser.add_argument("--loss-type", default="log_charbonnier", choices=V1_LOSS_TYPES)
     parser.add_argument("--num-particles", type=int, default=12)
@@ -363,8 +425,18 @@ def main(evaluation: bool = False) -> None:
     if not evaluation and args.eval_split == "paired_val":
         parser.error("Training/model selection MUST use --eval-split dev_select; reserve paired_val for locked validation only.")
 
-    config_keys = ("arch", "writeback_mode", "jfbr_mode", "proposal_mode", "num_particles",
-                   "dsm_weight", "loss_type", "split_seed", "seed")
+    config_keys = (
+        "arch",
+        "initialization",
+        "writeback_mode",
+        "jfbr_mode",
+        "proposal_mode",
+        "num_particles",
+        "dsm_weight",
+        "loss_type",
+        "split_seed",
+        "seed",
+    )
     config_keys = tuple(key for key in config_keys if hasattr(args, key))
     learned = not (args.arch.startswith("cl_") or args.arch == "sobol_lambert_lm")
     ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys,
@@ -402,7 +474,7 @@ def main(evaluation: bool = False) -> None:
                 k,
                 str(prep.rows[k]["record_key"]["source_id"]),
                 str(prep.rows[k]["record_key"]["rhythm"]),
-                prep.record(k, exact_initial=True),
+                prep.record(k, exact_initial=(args.initialization == "known_state")),
             )
             for k in keys
         )
@@ -410,15 +482,15 @@ def main(evaluation: bool = False) -> None:
     if evaluation or not learned:
         res = evaluate_filter_records(model, _pack_eval_items(eval_prep, eval_keys), device=args.device)
         out_path = args.run_dir / f"eval_{args.eval_split}.json"
-        out_path.write_text(json.dumps(res["summary"], indent=2) + "\n")
-        print(json.dumps(res["summary"]), flush=True)
+        out_path.write_text(metrics_json(res["summary"], indent=2) + "\n")
+        print(metrics_json(res["summary"]), flush=True)
         return
 
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
     fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     def selection_score(summary):
-        return float(summary["source_equal_summary"]["scaled_mse"])
+        return summary["source_equal_summary"]["scaled_mse"]
     best_p95 = restore_training_state(ckpt, optimizer, args.run_dir, selection_score)
 
     for epoch in range(start_epoch, args.epochs + 1):
@@ -434,7 +506,7 @@ def main(evaluation: bool = False) -> None:
             optimizer.zero_grad(set_to_none=True)
             batch_losses = []
             for key in batch_keys:
-                rec = train_prep.record(key, exact_initial=True)
+                rec = train_prep.record(key, exact_initial=(args.initialization == "known_state"))
                 if isinstance(model, FDASFSequentialFilter):
                     loss_k = train_fd_asf_proposal_step_on_record(
                         model,
@@ -467,7 +539,9 @@ def main(evaluation: bool = False) -> None:
             )
 
         val_res = evaluate_filter_records(model, _pack_eval_items(eval_prep, eval_keys), device=args.device)
-        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(json.dumps(val_res["summary"], indent=2) + "\n")
+        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(
+            metrics_json(val_res["summary"], indent=2) + "\n"
+        )
         best_p95 = save_epoch(args.run_dir / f"epoch_{epoch:02d}.pt", last_ckpt, model, optimizer,
                               args, config_keys, epoch, selection_score(val_res["summary"]), best_p95)
 

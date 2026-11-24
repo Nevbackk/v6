@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
+from .eval_metrics import metrics_json
 from .checkpoints import read_checkpoint, restore_training_state, save_epoch
 from .data.splits import partition_prepared_keys_by_source
 from .data.observation_clock import ObservationFrame, observation_frames
@@ -605,8 +606,10 @@ def main(evaluation: bool = False) -> None:
 
     if evaluation:
         res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
-        (args.run_dir / f"eval_v2_{args.eval_split}.json").write_text(json.dumps(res["summary"], indent=2) + "\n")
-        print(json.dumps(res["summary"]), flush=True)
+        (args.run_dir / f"eval_v2_{args.eval_split}.json").write_text(
+            metrics_json(res["summary"], indent=2) + "\n"
+        )
+        print(metrics_json(res["summary"]), flush=True)
         return
 
     train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
@@ -702,7 +705,9 @@ def main(evaluation: bool = False) -> None:
                 )
 
         val_res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
-        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(json.dumps(val_res["summary"], indent=2) + "\n")
+        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(
+            metrics_json(val_res["summary"], indent=2) + "\n"
+        )
         best_ep = save_epoch(args.run_dir / f"v2_epoch_{epoch:02d}.pt", last_ckpt, model, optimizer,
                              args, config_keys, epoch, selection_score(val_res["summary"]), best_ep,
                              replay=[asdict(smp) for smp in buffer.samples])

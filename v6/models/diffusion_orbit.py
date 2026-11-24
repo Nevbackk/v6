@@ -315,6 +315,61 @@ class AngularNoiseDiffusion(nn.Module):
         return vp_velocity_moment_loss(a * noise - b * clean, v, cov)
 
 
+class DirectAngularMoments(nn.Module):
+    """Matched heteroscedastic control with the same causal features and two angular moments."""
+
+    context = staticmethod(AngularNoiseDiffusion.context)
+
+    def __init__(self, dtype=DTYPE):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Linear(14, 48, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(48, 48, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(48, 5, dtype=dtype),
+        )
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def moments(self, context, steps=None, particles=None, generator=None):
+        mean, params = self.head(context).split((2, 3), dim=-1)
+        d0, off, d1 = params.unbind(-1)
+        root = torch.stack(
+            (d0.asinh().exp(), torch.zeros_like(off), off, d1.asinh().exp()), dim=-1
+        ).unflatten(-1, (2, 2))
+        return mean, root @ root.transpose(-1, -2)
+
+    def loss(self, clean, context):
+        mean, cov = self.moments(context)
+        return vp_velocity_moment_loss(clean, mean, cov)
+
+
+class CalibratedAngularMoments(nn.Module):
+    """Use the past-only measured angular noise scale without learned bias or shape."""
+
+    context = staticmethod(AngularNoiseDiffusion.context)
+
+    def __init__(self, dtype=DTYPE):
+        super().__init__()
+        self.register_buffer("unit_cov", torch.eye(2, dtype=dtype))
+
+    def moments(self, context, steps=None, particles=None, generator=None):
+        return torch.zeros_like(context[..., :2]), self.unit_cov.expand(*context.shape[:-1], 2, 2)
+
+    def loss(self, clean, context):
+        return clean.new_zeros(())
+
+
+def make_angular_model(kind, dtype=DTYPE):
+    models = {
+        "diffusion": AngularNoiseDiffusion,
+        "direct": DirectAngularMoments,
+        "calibrated": CalibratedAngularMoments,
+    }
+    return models[kind](dtype)
+
+
 def _whitened_likelihood_score(H, residual, covariance):
     """Square-root solve for one or a batch of independent local likelihoods."""
     L = safe_cholesky_spd(covariance.detach())
@@ -455,7 +510,94 @@ class OrbitStreamState:
     count: int = 0
 
 
-class VPOrbitDiffusionFilter(nn.Module):
+class FrameOrbitFilter(nn.Module):
+    """Batch the causal single-track interface used by both neural orbit estimators."""
+
+    def forward_filter_sequence(
+        self,
+        *,
+        initial_state_si: Tensor,
+        init_time_sec: Tensor | float,
+        times_sec: Tensor,
+        observed_los: Tensor,
+        station_states_si: Tensor,
+        valid_mask: Tensor | None = None,
+        **kwargs: Any,
+    ) -> TrainingFilterOutput:
+        unbatched = initial_state_si.ndim == 1
+        init_x = initial_state_si.unsqueeze(0) if unbatched else initial_state_si
+        batch = int(init_x.shape[0])
+        device = next(self.parameters(), next(self.buffers(), init_x)).device
+        init_t = torch.as_tensor(init_time_sec, dtype=torch.float64).reshape(-1)
+        if init_t.numel() == 1:
+            init_t = init_t.expand(batch)
+        t_seq = times_sec.unsqueeze(0) if times_sec.ndim == 1 else times_sec
+        obs_seq = observed_los.unsqueeze(0) if observed_los.ndim == 2 else observed_los
+        stn_seq = station_states_si.unsqueeze(0) if station_states_si.ndim == 2 else station_states_si
+        val_seq = (
+            torch.ones(t_seq.shape, dtype=torch.bool)
+            if valid_mask is None
+            else (valid_mask.unsqueeze(0) if valid_mask.ndim == 1 else valid_mask)
+        )
+        scale = state_scale(device=device, dtype=torch.float64)
+        priors_b, posts_b, preds_b, innovs_b = [], [], [], []
+        for b in range(batch):
+            optional = {}
+            for key, rank in (
+                ("station_ids", 1),
+                ("station_id_reliable", 1),
+                ("initial_station_si", 1),
+                ("initial_ref_cov_scaled", 2),
+            ):
+                if kwargs.get(key) is not None:
+                    value = torch.as_tensor(kwargs[key])
+                    optional[key] = value if value.ndim == rank else value[b]
+            res = self.rollout_track(
+                initial_state_si=init_x[b],
+                init_time_sec=float(init_t[b].item()),
+                times_sec=t_seq[b],
+                observed_los=obs_seq[b],
+                station_states_si=stn_seq[b],
+                valid_mask=val_seq[b],
+                seed=kwargs.get("seed", 20261028),
+                **optional,
+            )
+            pr, po = res["prior_states_si"], res["posterior_states_si"]
+            vb = val_seq[b].to(device=device)
+            obs_b = obs_seq[b].to(device=device, dtype=torch.float64)
+            u_hat = res["predicted_los"]
+            u_hat = torch.where(vb.unsqueeze(-1), u_hat, torch.zeros_like(u_hat))
+            inn = torch.where(vb.unsqueeze(-1), obs_b - u_hat, torch.zeros_like(obs_b))
+            priors_b.append(pr)
+            posts_b.append(po)
+            preds_b.append(u_hat)
+            innovs_b.append(inn)
+
+        priors = torch.stack(priors_b, dim=0)
+        posts = torch.stack(posts_b, dim=0)
+        preds = torch.stack(preds_b, dim=0)
+        innovs = torch.stack(innovs_b, dim=0)
+        corr_si = posts - priors
+        corr_scaled = corr_si / scale
+        val_dev = val_seq.to(device=device)
+        if unbatched:
+            priors, posts, corr_si, corr_scaled, preds, innovs, val_dev = (
+                x.squeeze(0) for x in (priors, posts, corr_si, corr_scaled, preds, innovs, val_dev)
+            )
+        return TrainingFilterOutput(
+            prior_states_si=priors,
+            posterior_states_si=posts,
+            gains=None,
+            correction_scaled=corr_scaled,
+            correction_si=corr_si,
+            innovations=innovs,
+            predicted_los=preds,
+            valid_mask=val_dev,
+            metadata=self.sequence_metadata(),
+        )
+
+
+class VPOrbitDiffusionFilter(FrameOrbitFilter):
     """Shared angular reverse Markov chain with optional six-dimensional state diffusion."""
 
     def __init__(
@@ -470,6 +612,7 @@ class VPOrbitDiffusionFilter(nn.Module):
         hidden_dim: int = 96,
         default_sigma_rad: float = 5.0e-4,
         known_initial: bool = False,
+        observation_model: str = "diffusion",
         dtype: torch.dtype = DTYPE,
     ) -> None:
         super().__init__()
@@ -498,7 +641,7 @@ class VPOrbitDiffusionFilter(nn.Module):
             nn.Linear(48 + 6 + 6 + 4, context_dim, dtype=dtype) if not known_initial else None
         )
         self.known_initial = known_initial
-        self.sensor = AngularNoiseDiffusion(dtype)
+        self.sensor = make_angular_model(observation_model, dtype)
         self.reference_prior = None
         self.denoiser = (
             CosineVPDenoiserNet(
@@ -646,7 +789,8 @@ class VPOrbitDiffusionFilter(nn.Module):
         initial_station_si=None,
         seed=20261028,
     ):
-        x = torch.as_tensor(initial_state_si).to(self.sensor.net.v_head.weight)
+        x = torch.as_tensor(initial_state_si, dtype=DTYPE)
+        x = x.to(next(self.parameters(), next(self.buffers(), x)))
         t0 = float(init_time_sec)
         if x.shape != (6,) or not math.isfinite(t0):
             raise ValueError("Expected a six-dimensional initial state and finite epoch")
@@ -857,92 +1001,15 @@ class VPOrbitDiffusionFilter(nn.Module):
             ledger=state.ledger.as_dict(),
         )
 
-    def forward_filter_sequence(
-        self,
-        *,
-        initial_state_si: Tensor,
-        init_time_sec: Tensor | float,
-        times_sec: Tensor,
-        observed_los: Tensor,
-        station_states_si: Tensor,
-        valid_mask: Tensor | None = None,
-        **kwargs: Any,
-    ) -> TrainingFilterOutput:
-        unbatched = initial_state_si.ndim == 1
-        init_x = initial_state_si.unsqueeze(0) if unbatched else initial_state_si
-        batch = int(init_x.shape[0])
-        device = self.sensor.net.v_head.weight.device
-        init_t = torch.as_tensor(init_time_sec, dtype=torch.float64).reshape(-1)
-        if init_t.numel() == 1:
-            init_t = init_t.expand(batch)
-        t_seq = times_sec.unsqueeze(0) if times_sec.ndim == 1 else times_sec
-        obs_seq = observed_los.unsqueeze(0) if observed_los.ndim == 2 else observed_los
-        stn_seq = station_states_si.unsqueeze(0) if station_states_si.ndim == 2 else station_states_si
-        val_seq = (
-            torch.ones(t_seq.shape, dtype=torch.bool)
-            if valid_mask is None
-            else (valid_mask.unsqueeze(0) if valid_mask.ndim == 1 else valid_mask)
-        )
-        scale = state_scale(device=device, dtype=torch.float64)
-        priors_b, posts_b, preds_b, innovs_b = [], [], [], []
-        for b in range(batch):
-            res = self.rollout_track(
-                initial_state_si=init_x[b],
-                init_time_sec=float(init_t[b].item()),
-                times_sec=t_seq[b],
-                observed_los=obs_seq[b],
-                station_states_si=stn_seq[b],
-                valid_mask=val_seq[b],
-                **{
-                    key: (
-                        kwargs[key]
-                        if unbatched and torch.as_tensor(kwargs[key]).ndim == 1
-                        else kwargs[key][b]
-                    )
-                    for key in ("station_ids", "station_id_reliable", "initial_station_si")
-                    if kwargs.get(key) is not None
-                },
-            )
-            pr, po = res["prior_states_si"], res["posterior_states_si"]
-            vb = val_seq[b].to(device=device)
-            obs_b = obs_seq[b].to(device=device, dtype=torch.float64)
-            u_hat = res["predicted_los"]
-            u_hat = torch.where(vb.unsqueeze(-1), u_hat, torch.zeros_like(u_hat))
-            inn = torch.where(vb.unsqueeze(-1), obs_b - u_hat, torch.zeros_like(obs_b))
-            priors_b.append(pr)
-            posts_b.append(po)
-            preds_b.append(u_hat)
-            innovs_b.append(inn)
-
-        priors = torch.stack(priors_b, dim=0)
-        posts = torch.stack(posts_b, dim=0)
-        preds = torch.stack(preds_b, dim=0)
-        innovs = torch.stack(innovs_b, dim=0)
-        corr_si = posts - priors
-        corr_scaled = corr_si / scale
-        val_dev = val_seq.to(device=device)
-        if unbatched:
-            priors, posts, corr_si, corr_scaled, preds, innovs, val_dev = (
-                x.squeeze(0) for x in (priors, posts, corr_si, corr_scaled, preds, innovs, val_dev)
-            )
-        return TrainingFilterOutput(
-            prior_states_si=priors,
-            posterior_states_si=posts,
-            gains=None,
-            correction_scaled=corr_scaled,
-            correction_si=corr_si,
-            innovations=innovs,
-            predicted_los=preds,
-            valid_mask=val_dev,
-            metadata={
-                "model_family": "known_initial_angular_diffusion"
-                if self.known_initial
-                else "route_a_vp_orbit_diffusion",
-                "K": self.num_reverse_steps,
-                "P": self.num_particles,
-                "delta": self.delta,
-            },
-        )
+    def sequence_metadata(self):
+        return {
+            "model_family": "known_initial_angular_diffusion"
+            if self.known_initial
+            else "route_a_vp_orbit_diffusion",
+            "K": self.num_reverse_steps,
+            "P": self.num_particles,
+            "delta": self.delta,
+        }
 
 
 # ==============================================================================

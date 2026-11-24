@@ -17,6 +17,8 @@ from .reprojection import (ComputeLedger, WindowReprojectionResult,
     estimate_online_los_noise_floor, select_causal_keyframes)
 from .v1_ltr_lm import (ClassicalLMRefiner, JFBRRefiner, LTRLMRefiner,
     PriorProtectionGate, V1OnlineFilter, solve_damped_normal_equations)
+from .posterior_warp import ConditionalOrbitWarp, WarpedOrbitPosterior
+from .ppc_flow import PPCOrbitFilter
 from .v1_fd_asf import (AttributableChart2Plus4, LambertChart2Plus4,
     ContinuousTrackletEncoder, ConditionalRealNVP2D, DefensiveProposalMixture,
     DominanceGatedPublisher, FDASFSequentialFilter,
@@ -94,6 +96,9 @@ __all__ = [
     "PendingSubspaceMemory",
     "transport_pending_subspace_qr",
     "unlock_pending_directions_and_basis",
+    "ConditionalOrbitWarp",
+    "WarpedOrbitPosterior",
+    "PPCOrbitFilter",
     "AngularNoiseDiffusion",
     "OrbitStreamState",
     "CosineVPDenoiserNet",

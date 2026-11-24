@@ -79,16 +79,16 @@ No KalmanNet network or experiment infrastructure is needed at runtime.
 
 ## Per-frame orbit estimation
 
-Each valid LOS arrival produces a prior and a posterior. The filter uses the time since the preceding valid sample, including across gaps and masked padding. The last observation is processed as it arrives.
+V1 learns the angular sensor from a known initial state. V2 starts at the supplied noisy Gauss–LS estimate and updates **one normalized six-dimensional probability density** on each valid LOS arrival. Both use the actual elapsed time, known station state and deterministic two-body dynamics. Batch replay calls the same per-frame recursion as a live stream.
 
-| Entry point | Initial state | Learned update |
+| Entry point | Orbit state carried between observations | What each arrival contributes |
 | --- | --- | --- |
-| `scripts/train_v1.py` | Known six-dimensional state at the initialization epoch | Propagate the known orbit by two-body RK4 and learn the distribution of angular measurement errors in its LOS tangent plane. Each frame returns a predicted LOS, angular covariance and predictive score. |
-| `scripts/train_v2.py` | Frozen, noisy Gauss-LS estimate | Apply the same angular noise model to center and whiten the new LOS likelihood, then run guided six-dimensional state diffusion. Propagate the resulting state samples and reference covariance to the next observation. |
+| `scripts/train_v1.py` | A known state propagated by RK4 | A predictive angular bias and covariance from a learned reverse Markov chain, followed by a sensor innovation and score. |
+| `scripts/train_v2.py` (default `--arch ppc`) | One invertible spline density with a physical reference, a full-rank factor and 150 shape coefficients | One reference orbit and its first two variations propagate the previous shape. A QR update absorbs the local Gaussian information. The remaining spherical likelihood changes the shape and relative mass within that same density. |
 
-For a live stream, call `state = model.start_track(x0, t0)` once and `model.step(state, tk, los, station)` on each arrival. Independent tracks own their history, noise estimator and random generator. Batch rollout invokes the same step.
+For V2, call `state = model.start_track(x0, t0)` once and `result = model.step(state, tk, los, station)` at each arrival. `result["distribution"].log_prob(x_si)` gives the full state log density in SI units. `model.readout(state.posterior)` returns quadrature estimates of the mean, covariance and marginal intervals. Integration nodes serve individual integrals and carry no trajectory identity.
 
-Both versions use a learned **reverse Markov chain in angular noise space**. A cosine VP forward process defines intermediate noise levels. Each reverse transition conditions on the current latent, the noise level and geometry available before the new measurement. The last step combines conditional means and variances. V2 additionally integrates a guided probability-flow ODE for the orbit error. `--K` controls artificial-time integration and `--P` controls Monte Carlo sampling. Physical time always comes from the recorded epochs.
+The default sensor uses four cosine VP reverse transitions. Within V2, `--K` also sets the number of fractional likelihood updates whose powers sum to one. `--P` controls angular sampling and the number of CFM training pairs, `--warp-nodes` sets the integration rule per reference chart, and `--unroll-frames` sets the training gradient span. Physical propagation always uses the observation timestamps.
 
 ```bash
 python scripts/train_v1.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v1
@@ -96,14 +96,24 @@ python scripts/train_v2.py --prepared-root /path/to/prepared --protocol-dir /pat
 python scripts/validate_v2.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v2 --eval-split paired_val
 ```
 
-The clean V1 control uses `initial_truth_state_si` in the initialization record when supplied, or reference ephemeris at or before that epoch in the prepared shard. V2 also supports joint training from scratch. A transferred sensor must come from the same source split. V1 selects checkpoints on held-out tangent-plane measurement NLL (Gaussian moment approximation). V2 selects on source-equal, full-track six-state scaled MSE. The evaluation includes all valid frames, last-frame errors, four cadence tables and initialization strata. Models using the new recursion require a fresh training run.
+V1 selects on held-out angular Gaussian moment NLL. V2 selects on source-equal full-record scaled MSE. Evaluation also reports failed records, the four sampling cadences, initialization strata, six-dimensional density and 90% highest-density coverage, and the next observed LOS predictive score and cone coverage for PPC and its Gaussian controls. Sensor transfer requires the same source split and sensor model. The main Bash and PowerShell V2 runners save under `ppc/seed_*`.
 
-The `main` stages in `scripts/run_experiment_v1.{sh,ps1}` and `scripts/run_experiment_v2.{sh,ps1}` train these versions. Specify `SENSOR_CHECKPOINT` when initializing the V2 runner from V1. The `paired_val` stage validates each version's saved best model.
+## Matched controls and CPU checks
 
-## Alternative estimators
+| Option | What it measures |
+| --- | --- |
+| `train_v2.py --arch qr --observation-model calibrated` | Classical local Gaussian reference with causal angular calibration. |
+| `train_v2.py --arch gaussian --observation-model direct` | Same nonlinear evidence and quadrature as PPC, projected onto one Gaussian. |
+| `train_v2.py --arch ppc --observation-model direct` | Direct heteroscedastic sensor moments in place of the angular diffusion chain. |
+| `train_v1.py --arch cl_full_prefix_wls --initialization gauss_ls` | Causal full-prefix least squares starting from the same noisy initial state as V2. |
+| `train_v2.py --arch diffusion` | Previous state VP/VJP filter. Archived ASD-SC and B1/B2 experiments have their own explicit entries. |
 
-- `train_v1.py --arch ltr_lm`, `jf_br`, `fd_asf` and the `cl_*` controls use the clean-start protocol. Each valid arrival triggers propagation and a causal refinement or particle update.
-- `train_v2.py --arch asd_sc` runs the noisy-start subspace control. The next valid frame tests each frozen range candidate. Two-frame training uses the actual following epoch for its forecast loss.
-- `train_diffusion.py --route a` runs the V2 state diffusion filter. `--route b1` samples invertible chart flow proposals; `--route b2` uses twisted SMC with explicit transition densities. Both chart alternatives update the orbit posterior at each arrival. The optional `--B-los` budget subsamples proposal guidance, and terminal importance weights use the full available LOS prefix.
+On a controlled range slice with two positive solutions near 4,200 and 8,358 km, three independently trained splines assigned 2.58–3.00% to the interval between the peaks, compared with 34.56% for the matched projected Gaussian. The reference grid assigns about 0.00000085%. This experiment isolates shape estimation in one physical dimension with five Gaussian nuisance coordinates. Full G4 orbit accuracy and good-initial-orbit performance require the corresponding data evaluation.
 
-See the [model equations and experimental protocol](docs/METHODS_V1_V2_CN.md). Run `python -s -m unittest discover -s tests -v` for the CPU suite.
+```bash
+python scripts/check_ppc_two_ranges.py --seed 17 --iterations 500 --output range.json --figure range.png
+python scripts/profile_frame_filter.py --arch ppc
+python -s -m unittest discover -s tests -v
+```
+
+The physical prediction uses a local second-order approximation. The shipping estimator takes an external initial state. Detailed equations, sensor alternatives, training losses and experiment definitions appear in the [method description](docs/METHODS_V1_V2_CN.md).

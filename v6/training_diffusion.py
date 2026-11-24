@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 
 from .data.prepared import Prepared
+from .eval_metrics import metrics_json
 from .checkpoints import read_checkpoint, restore_training_state, save_epoch
 from .reference_prior import fit_reference_prior
 from .data.splits import partition_prepared_keys_by_source
@@ -25,6 +26,7 @@ from .models.diffusion_orbit import (
     vp_velocity_moment_loss,
 )
 from .models.v1_fd_asf import ContinuousTrackletEncoder
+from .models.ppc_flow import PPCOrbitFilter
 from .models.orbit_proposals import EmptyTeacherSupport, RouteBOrbitFilter, draw_chart_teacher
 from .training_v1 import evaluate_filter_records
 
@@ -36,6 +38,7 @@ def train_route_a_vp_step_on_record(
     num_noise_samples: int = 4,
     use_rollout_priors: bool = True,
     rollout_prior_prob: float = 0.5,
+    unroll_frames: int = 1,
     device: torch.device | str = "cpu",
 ) -> Tensor:
     """Supervise the sensor at every arrival and V2 on the six-dimensional prior error."""
@@ -80,7 +83,9 @@ def train_route_a_vp_step_on_record(
                 torch.linalg.solve_triangular(L, ((truth[k] - prior) / scale)[:, None], upper=False)[:, 0]
             )
             state_inputs.append(model.state_context(prior, L, frame.time_sec - t0, sigma, count, hidden))
-            hidden = model.tracklet_encoder.advance(hidden.detach(), obs[k], stations[k], frame.dt_sec)
+            hidden = model.tracklet_encoder.advance(
+                hidden.detach() if count % unroll_frames == 0 else hidden, obs[k], stations[k], frame.dt_sec
+            )
     loss = model.sensor.loss(torch.stack(angular), torch.stack(sensor_inputs))
     if model.known_initial:
         return loss
@@ -111,22 +116,57 @@ def train_route_b_cosine_flow_step_on_record(
     return flow_b.cosine_cfm_loss(z, branch, eta, w_star if use_chord_disagreement else w_pi, context)
 
 
-def main(evaluation: bool = False, *, version="v2") -> None:
+def main(evaluation: bool = False, *, version="v2", default_arch="diffusion") -> None:
     parser = argparse.ArgumentParser(
-        description=f"Per-frame orbit diffusion ({version.upper()})",
+        description=f"Per-frame orbit estimation ({version.upper()})",
         epilog="Use --arch ltr_lm or fd_asf for V1 controls; use --arch asd_sc for the V2 control.",
     )
     parser.add_argument("--prepared-root", type=Path, required=True)
     parser.add_argument("--protocol-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--arch", choices=("diffusion",), default="diffusion")
+    parser.add_argument("--arch", choices=("ppc", "qr", "gaussian", "diffusion"), default=default_arch)
+    parser.add_argument(
+        "--observation-model",
+        choices=("diffusion", "direct", "calibrated"),
+        default="diffusion",
+        help="Angular reverse chain, direct heteroscedastic MLP, or causal measured noise floor",
+    )
+    parser.add_argument(
+        "--initial-bias",
+        choices=("none", "train_mean"),
+        default="none",
+        help="PPC and Gaussian controls can ablate the TRAIN-fit mean correction to B0",
+    )
+    parser.add_argument(
+        "--unroll-frames",
+        type=int,
+        help="Training gradient span across valid arrivals (PPC default 2, VP control 1)",
+    )
+    parser.add_argument(
+        "--warp-nodes",
+        type=int,
+        default=128,
+        help="Deterministic Gaussian integration points per PPC reference",
+    )
     parser.add_argument(
         "--sensor-checkpoint", type=Path, help="Initialize the V2 sensor model from a V1 checkpoint"
     )
     parser.add_argument("--route", choices=("a", "b1", "b2"), default="a")
-    parser.add_argument("--K", type=int, default=4, help="Core knob 1: artificial reverse diffusion intervals")
-    parser.add_argument("--P", type=int, default=8, help="Core knob 2: independent seeds / particles")
-    parser.add_argument("--delta", type=float, default=0.10, help="Core knob 3: min reference covariance fraction")
+    parser.add_argument(
+        "--K",
+        type=int,
+        default=4,
+        help="PPC likelihood increments and angular reverse steps, or control integration steps",
+    )
+    parser.add_argument(
+        "--P",
+        type=int,
+        default=8,
+        help="Angular sampling and training CFM budget for PPC, or particles for the VP/chart controls",
+    )
+    parser.add_argument(
+        "--delta", type=float, default=0.10, help="Reference covariance fraction for the VP state control"
+    )
     parser.add_argument(
         "--B-los",
         type=int,
@@ -153,6 +193,11 @@ def main(evaluation: bool = False, *, version="v2") -> None:
     args.version = version
     config_keys = (
         "version",
+        "arch",
+        "warp_nodes",
+        "unroll_frames",
+        "observation_model",
+        "initial_bias",
         "route",
         "K",
         "P",
@@ -164,8 +209,39 @@ def main(evaluation: bool = False, *, version="v2") -> None:
         "split_seed",
         "seed",
     )
-    ckpt = read_checkpoint(args, parser, evaluation=evaluation, config_keys=config_keys,
-                           eval_overrides=("K", "P", "B_los", "guidance_mode", "delta"))
+    ckpt = read_checkpoint(
+        args,
+        parser,
+        evaluation=evaluation,
+        config_keys=config_keys,
+        eval_overrides=("K", "P", "B_los", "guidance_mode", "delta"),
+        require_weights=not (
+            args.observation_model == "calibrated" and (args.arch in ("qr", "gaussian") or version == "v1")
+        ),
+    )
+    if args.unroll_frames is None:
+        args.unroll_frames = 2 if args.arch == "ppc" else 1
+    if args.unroll_frames < 1:
+        parser.error("--unroll-frames must be positive")
+    if ckpt and ckpt.get("arch", "diffusion") != args.arch:
+        parser.error("The requested model differs from the checkpoint architecture")
+    if args.arch in ("ppc", "qr", "gaussian"):
+        if version != "v2" or args.route != "a":
+            parser.error("PPC is a single noisy-initial V2 estimator")
+        if (
+            args.B_los
+            or args.guidance_mode != "vjp"
+            or args.fixed_isotropic_v
+            or args.no_rollout_priors
+            or args.delta != parser.get_default("delta")
+        ):
+            parser.error("VP state-sampler and chart-proposal ablations apply to --arch diffusion")
+    elif args.warp_nodes != parser.get_default("warp_nodes"):
+        parser.error("--warp-nodes applies to PPC and its Gaussian controls")
+    if args.arch == "diffusion" and args.initial_bias != "none":
+        parser.error("--initial-bias applies to PPC and its matched Gaussian controls")
+    if args.route != "a" and args.observation_model != "diffusion":
+        parser.error("The chart proposal controls have their own observation model")
     if args.K < 1 or args.P < 1 or args.B_los < 0 or not 0 < args.delta <= 1:
         parser.error("K and P must be positive, B-los nonnegative and delta in (0,1]")
     if args.route != "a" and (args.guidance_mode == "identity_jac" or args.fixed_isotropic_v
@@ -191,7 +267,17 @@ def main(evaluation: bool = False, *, version="v2") -> None:
     torch.manual_seed(args.seed)
     args.run_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.route == "a":
+    name = args.arch if args.arch != "diffusion" else "diff"
+    if args.arch in ("ppc", "qr", "gaussian"):
+        model = PPCOrbitFilter(
+            steps=args.K,
+            sensor_samples=args.P,
+            nodes=args.warp_nodes,
+            estimator=args.arch,
+            observation_model=args.observation_model,
+            initial_bias=args.initial_bias,
+        )
+    elif args.route == "a":
         model = VPOrbitDiffusionFilter(
             num_reverse_steps=args.K,
             num_particles=args.P,
@@ -199,6 +285,7 @@ def main(evaluation: bool = False, *, version="v2") -> None:
             guidance_mode=args.guidance_mode,
             fixed_isotropic_v=args.fixed_isotropic_v,
             known_initial=(version == "v1"),
+            observation_model=args.observation_model,
         )
     else:
         model = RouteBOrbitFilter(args.route, num_steps=args.K, num_particles=args.P,
@@ -207,8 +294,10 @@ def main(evaluation: bool = False, *, version="v2") -> None:
     model.to(args.device)
     if args.sensor_checkpoint:
         source = torch.load(args.sensor_checkpoint, map_location="cpu", weights_only=True)
+        if source.get("observation_model", "diffusion") != args.observation_model:
+            parser.error("V1 and V2 must use the same observation model for sensor transfer")
         if source.get("version") != "v1":
-            parser.error("Expected a V1 angular diffusion checkpoint")
+            parser.error("Expected a V1 angular sensor checkpoint")
         if source.get("recursion") != "valid_frame" or source.get("split_seed") != args.split_seed:
             parser.error("The sensor checkpoint must use the same per-frame protocol and source split seed")
         model.sensor.load_state_dict(
@@ -244,16 +333,21 @@ def main(evaluation: bool = False, *, version="v2") -> None:
             for k in keys
         )
 
-    if evaluation:
+    learned = any(p.requires_grad for p in model.parameters())
+    train_prep = fit_keys = None
+    if not evaluation or (not learned and version == "v2"):
+        train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
+        fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
+        if args.route == "a" and version == "v2" and model.reference_prior is None:
+            model.reference_prior = fit_reference_prior(train_prep, fit_keys)
+    if evaluation or not learned:
         res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
-        (args.run_dir / f"eval_diff_{args.eval_split}.json").write_text(json.dumps(res["summary"], indent=2) + "\n")
-        print(json.dumps(res["summary"]), flush=True)
+        (args.run_dir / f"eval_{name}_{args.eval_split}.json").write_text(
+            metrics_json(res["summary"], indent=2) + "\n"
+        )
+        print(metrics_json(res["summary"]), flush=True)
         return
 
-    train_prep = Prepared(args.prepared_root, args.protocol_dir, "train")
-    fit_keys = partition_prepared_keys_by_source(train_prep.rows, seed=args.split_seed)["train_fit"]
-    if args.route == "a" and version == "v2" and model.reference_prior is None:
-        model.reference_prior = fit_reference_prior(train_prep, fit_keys)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1.0e-4)
     def selection_score(summary):
         if version == "v1":
@@ -278,9 +372,26 @@ def main(evaluation: bool = False, *, version="v2") -> None:
             count = 0
             for key in batch_keys:
                 record = train_prep.record(key, exact_initial=(version == "v1"))
+                if args.arch in ("ppc", "qr", "gaussian"):
+                    mask = record.get("valid_mask")
+                    frame_count = (
+                        len(record["times_sec"]) if mask is None else int(torch.as_tensor(mask).sum())
+                    )
+                    if not frame_count:
+                        raise ValueError("No valid PPC training frame")
+                    for frame_loss in model.training_loss_chunks(record, args.unroll_frames):
+                        part = frame_loss / frame_count
+                        part.backward()
+                        total_loss += float(part.detach())
+                    count += 1
+                    continue
                 if args.route == "a":
                     term = train_route_a_vp_step_on_record(
-                        model, record, use_rollout_priors=not args.no_rollout_priors, device=args.device
+                        model,
+                        record,
+                        use_rollout_priors=not args.no_rollout_priors,
+                        unroll_frames=args.unroll_frames,
+                        device=args.device,
                     )
                 else:
                     try:
@@ -321,11 +432,21 @@ def main(evaluation: bool = False, *, version="v2") -> None:
         if trained_records == 0:
             raise ValueError("No usable training record in this epoch")
         val_res = evaluate_filter_records(model, _pack_eval(eval_prep, eval_keys), device=args.device)
-        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(json.dumps(val_res["summary"], indent=2) + "\n")
-        best_score = save_epoch(args.run_dir / f"diff_epoch_{epoch:02d}.pt", last_ckpt,
-                                model, optimizer, args, config_keys, epoch,
-                                selection_score(val_res["summary"]), best_score,
-                                reference_prior=getattr(model, "reference_prior", None))
+        (args.run_dir / f"dev_select_{epoch:02d}.json").write_text(
+            metrics_json(val_res["summary"], indent=2) + "\n"
+        )
+        best_score = save_epoch(
+            args.run_dir / f"{name}_epoch_{epoch:02d}.pt",
+            last_ckpt,
+            model,
+            optimizer,
+            args,
+            config_keys,
+            epoch,
+            selection_score(val_res["summary"]),
+            best_score,
+            reference_prior=getattr(model, "reference_prior", None),
+        )
 
 
 __all__ = [

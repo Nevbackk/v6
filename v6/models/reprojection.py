@@ -228,6 +228,51 @@ def propagate_si_with_stm(
     return x, phi
 
 
+def propagate_reference_jet(center_si, factor_si, dt_sec, *, ledger=None):
+    """One physical RK4 trajectory with first/second variations w.r.t. six chart coordinates."""
+    steps = int(math.ceil(abs(dt_sec) / MAX_SUBSTEP_SEC))
+    second = center_si.new_zeros((6, 6, 6))
+    if not steps:
+        return center_si, factor_si, second
+    if ledger is not None:
+        ledger.rk4_substeps += steps
+        ledger.stm_substeps += steps
+    dt = dt_sec / steps
+
+    def rhs(x, J, S):
+        tangents = torch.cat((J, S.flatten(1)), dim=1)
+        fx, variation = _two_body_rhs_and_jacobian(x[None], tangents[None])
+        dJ, linear_second = variation[0].split((6, 36), dim=1)
+        r = x[:3]
+        radius = r.norm().clamp_min(1.0)
+        direction = r / radius
+        dr = J[:3]
+        projection = direction @ dr
+        mixed = dr[:, :, None] * projection[None, None, :]
+        # D^2(-mu r/|r|^3)[dr_i,dr_j], evaluated only on the reference orbit.
+        quadratic = (3 * MU_EARTH_M3_S2 / radius**4) * (
+            mixed
+            + mixed.transpose(1, 2)
+            + direction[:, None, None] * (dr.T @ dr - 5 * torch.outer(projection, projection))
+        )
+        return (
+            fx[0],
+            dJ,
+            linear_second.reshape(6, 6, 6) + torch.cat((torch.zeros_like(quadratic), quadratic)),
+        )
+
+    state = (center_si, factor_si, second)
+    for _ in range(steps):
+        k1 = rhs(*state)
+        k2 = rhs(*(x + dt * k / 2 for x, k in zip(state, k1)))
+        k3 = rhs(*(x + dt * k / 2 for x, k in zip(state, k2)))
+        k4 = rhs(*(x + dt * k for x, k in zip(state, k3)))
+        state = tuple(
+            x + (dt / 6) * (a + 2 * b + 2 * c + d) for x, a, b, c, d in zip(state, k1, k2, k3, k4)
+        )
+    return state
+
+
 def local_msc_chart_basis(
     state_si: Tensor,
     station_pos_si: Tensor,

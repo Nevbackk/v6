@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-Complete Execution Pipeline — Model Plan V2 (ASD-SC Progressive Denoising & Self-Correction)
+Train one continuous PPC posterior per track or run the independent ASD-SC controls.
 
 .EXAMPLE
 .\scripts\run_experiment_v2.ps1 -PreparedRoot "D:\G4\prepared" -ProtocolDir "D:\G4\protocol" -Device "cuda"
@@ -40,7 +40,7 @@ function Invoke-ExperimentPython {
 }
 
 Write-Host "======================================================================"
-Write-Host "[Model Plan V2: ASD-SC] Stage='$Stage' | Device='$Device' | Output='$OutputRoot'"
+Write-Host "[V2] Stage='$Stage' | Device='$Device' | Output='$OutputRoot'"
 Write-Host "======================================================================"
 
 if ($Stage -in @("all", "test")) {
@@ -68,10 +68,10 @@ $CommonArgs = @(
 
 if ($Stage -in @("all", "main")) {
     foreach ($seed in $Seeds) {
-        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        $runDir = Join-Path $OutputRoot "ppc\seed_$seed"
         $initArgs = @()
         if ($SensorCheckpoint -and -not (Test-Path (Join-Path $runDir "last.pt"))) { $initArgs = @("--sensor-checkpoint", $SensorCheckpoint) }
-        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs --arch diffusion --run-dir $runDir --seed $seed @initArgs
+        Invoke-ExperimentPython "$V6Dir\scripts\train_v2.py" @CommonArgs --arch ppc --run-dir $runDir --seed $seed @initArgs
     }
 }
 
@@ -145,10 +145,10 @@ if ($Stage -in @("all", "abl5_memory_reanchor")) {
 
 if ($RunPairedVal -or ($Stage -eq "paired_val")) {
     foreach ($seed in $Seeds) {
-        $runDir = Join-Path $OutputRoot "diffusion\seed_$seed"
+        $runDir = Join-Path $OutputRoot "ppc\seed_$seed"
         $best = Join-Path $runDir "best.pt"
         if (-not (Test-Path -LiteralPath $best -PathType Leaf)) { throw "Missing required checkpoint: $best" }
-        Invoke-ExperimentPython "$V6Dir\scripts\validate_v2.py" @CommonArgs --arch diffusion --run-dir $runDir --resume $best --eval-split paired_val
+        Invoke-ExperimentPython "$V6Dir\scripts\validate_v2.py" @CommonArgs --arch ppc --run-dir $runDir --resume $best --eval-split paired_val
     }
 }
 if ($RunPairedVal -and ($Stage -eq "all")) {
@@ -171,4 +171,4 @@ if ($RunPairedVal -and ($Stage -eq "all")) {
     }
 }
 
-Write-Host "[Model Plan V2: ASD-SC] Completed successfully."
+Write-Host "[V2] Completed successfully."

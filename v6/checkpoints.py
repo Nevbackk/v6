@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import sys
 
@@ -59,7 +60,8 @@ def restore_training_state(ckpt, optimizer, run_dir, score_fn):
         report = run_dir / f"dev_select_{epoch:02d}.json"
         if not report.is_file():
             raise ValueError(f"Cannot recover the selected validation metric: {report}")
-        return score_fn(json.loads(report.read_text(encoding="utf-8")))
+        score = score_fn(json.loads(report.read_text(encoding="utf-8")))
+        return float(score) if score is not None else float("inf")
     return float("inf")
 
 
@@ -81,7 +83,9 @@ def save_epoch(path, last_path, model, optimizer, args, config_keys, epoch, scor
         **extra,
     }
     destinations = [path]
-    if score < best_score or not (path.parent / "best.pt").is_file():
+    if math.isfinite(score) and (
+        score < best_score or (score == best_score and not (path.parent / "best.pt").is_file())
+    ):
         destinations.append(path.parent / "best.pt")
     # last.pt is the resume pointer. Publish it only after all epoch outputs exist.
     destinations.append(last_path)

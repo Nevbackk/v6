@@ -202,7 +202,8 @@ class FrameDiffusionTests(unittest.TestCase):
                 self.assertEqual(trained.returncode, 0, trained.stderr)
                 tested = call("validate", version, ["--eval-split", "paired_val"])
                 self.assertEqual(tested.returncode, 0, tested.stderr)
-                summary = json.loads((root / version / "eval_diff_paired_val.json").read_text())
+                metric_file = "eval_diff_paired_val.json" if version == "v1" else "eval_ppc_paired_val.json"
+                summary = json.loads((root / version / metric_file).read_text())
                 self.assertEqual(
                     summary["initializations"], ["known_state" if version == "v1" else "gauss_ls"]
                 )
@@ -211,7 +212,11 @@ class FrameDiffusionTests(unittest.TestCase):
                 self.assertEqual(saved["version"], version)
                 self.assertEqual(saved["recursion"], "valid_frame")
                 self.assertTrue(any(k.startswith("sensor.net.") for k in saved["model"]))
-                self.assertEqual(any(k.startswith("denoiser.") for k in saved["model"]), version == "v2")
+                self.assertEqual(saved["arch"], "diffusion" if version == "v1" else "ppc")
+                if version == "v2":
+                    self.assertIn("posterior_nll_si", summary["overall"])
+                    self.assertTrue(any(k.startswith("warp.conditioners.") for k in saved["model"]))
+                    self.assertTrue(torch.isfinite(torch.tensor(summary["overall"]["posterior_nll_si"])))
             wrong = call("validate", "v2", ["--resume", str(root / "v1" / "best.pt")])
             self.assertNotEqual(wrong.returncode, 0)
             self.assertIn("initialization protocol", wrong.stderr)

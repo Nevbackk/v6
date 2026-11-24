@@ -1,22 +1,7 @@
 #!/usr/bin/env bash
-# ==============================================================================
-# Complete Execution Pipeline — Model Plan V2 (ASD-SC Progressive Denoising)
-# ==============================================================================
-# Implements the full Round 4 experimental matrix & primary endpoint protocol in
-# docs/MODEL_V2_ADAPTIVE_DENOISING_PLAN.md and ROUND4_NOISY_INIT_SELFCORRECT_REVIEW.md:
-#   - Stage 0: Local CPU mathematical & structural unit checks
-#   - Stage 1: Main ASD-SC Full Progressive Model across 3 pre-registered seeds
-#   - Stage 2 (V2-Abl-1): Prior + LOS Synergy (obs_only vs state_only vs no_cf vs full)
-#   - Stage 3 (V2-Abl-2): Blind Scale Trust Gate (fixed_g vs unconstrained_mlp6d vs no_quantile_aux)
-#   - Stage 4 (V2-Abl-3): 2x2 {Static B0, DAgger Replay} x {1-Step Grad, 2-Step Unroll}
-#   - Stage 5 (V2-Abl-4): Next observed frame & Progressive Step-Increment T_l d_l
-#   - Stage 6 (V2-Abl-5): Cross-Gap QR Pending Memory V_p/K_p/E_a & Tier-2 A/B/C Re-anchoring
-#   - Stage 7: Locked Paired Replication on historical VAL (all valid frames)
-#
-# Usage (Linux / AutoDL CUDA Server):
-#   PREPARED_ROOT=/path/to/prepared PROTOCOL_DIR=/path/to/protocol \
-#     bash scripts/run_experiment_v2.sh
-# ==============================================================================
+# Main trains one continuous PPC posterior per track. The named ASD-SC stages
+# run independent comparison experiments. paired_val evaluates the saved PPC run.
+# Usage: PREPARED_ROOT=/path/to/prepared PROTOCOL_DIR=/path/to/protocol bash scripts/run_experiment_v2.sh
 
 set -euo pipefail
 
@@ -48,7 +33,7 @@ esac
 ABL_SEED="${ABL_SEED:-${SEEDS_ARR[0]}}"
 
 echo "======================================================================"
-echo "[Model Plan V2: ASD-SC] Starting Stage='${STAGE}' | Device='${DEVICE}'"
+echo "[V2] Starting Stage='${STAGE}' | Device='${DEVICE}'"
 echo "Codebase: ${V6_DIR}"
 echo "Output  : ${OUTPUT_ROOT}"
 echo "======================================================================"
@@ -57,7 +42,7 @@ echo "======================================================================"
 # Stage 0: CPU Mathematical & Orthogonality Unit Checks
 # ------------------------------------------------------------------------------
 if [[ "${STAGE}" == "all" || "${STAGE}" == "test" ]]; then
-  echo "[V2][Stage 0] Running V2 QR, E_a restricted writeback, and progressive target unit tests..."
+  echo "[V2][Stage 0] Running per-frame orbit estimation tests..."
   (cd "${V6_DIR}" && "${PYTHON_BIN}" -s -m unittest discover -s tests -v)
   if [[ "${STAGE}" == "test" ]]; then
     exit 0
@@ -81,11 +66,11 @@ COMMON_ARGS=(
 
 if [[ "${STAGE}" == "all" || "${STAGE}" == "main" ]]; then
   for SEED in "${SEEDS_ARR[@]}"; do
-    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    RUN_DIR="${OUTPUT_ROOT}/ppc/seed_${SEED}"
     INIT_ARGS=()
     if [[ -n "${SENSOR_CHECKPOINT:-}" && ! -f "${RUN_DIR}/last.pt" ]]; then INIT_ARGS=(--sensor-checkpoint "${SENSOR_CHECKPOINT}"); fi
     "${PYTHON_BIN}" "${V6_DIR}/scripts/train_v2.py" "${COMMON_ARGS[@]}" \
-      --arch diffusion --run-dir "${RUN_DIR}" --seed "${SEED}" "${INIT_ARGS[@]}"
+      --arch ppc --run-dir "${RUN_DIR}" --seed "${SEED}" "${INIT_ARGS[@]}"
   done
 fi
 
@@ -254,10 +239,10 @@ fi
 # ------------------------------------------------------------------------------
 if [[ "${RUN_PAIRED_VAL}" == "1" || "${STAGE}" == "paired_val" ]]; then
   for SEED in "${SEEDS_ARR[@]}"; do
-    RUN_DIR="${OUTPUT_ROOT}/diffusion/seed_${SEED}"
+    RUN_DIR="${OUTPUT_ROOT}/ppc/seed_${SEED}"
     [[ -f "${RUN_DIR}/best.pt" ]] || { echo "Missing required checkpoint: ${RUN_DIR}/best.pt" >&2; exit 2; }
     "${PYTHON_BIN}" "${V6_DIR}/scripts/validate_v2.py" "${COMMON_ARGS[@]}" \
-      --arch diffusion --run-dir "${RUN_DIR}" --resume "${RUN_DIR}/best.pt" --eval-split paired_val
+      --arch ppc --run-dir "${RUN_DIR}" --resume "${RUN_DIR}/best.pt" --eval-split paired_val
   done
 fi
 
@@ -290,4 +275,4 @@ if [[ "${RUN_PAIRED_VAL}" == "1" && "${STAGE}" == "all" ]]; then
   done
 fi
 
-echo "[Model Plan V2: ASD-SC] Pipeline execution finished cleanly."
+echo "[V2] Pipeline execution finished cleanly."

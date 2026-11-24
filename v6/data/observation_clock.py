@@ -14,6 +14,16 @@ class ObservationFrame:
     dt_sec: float
 
 
+class FrameNumericalError(FloatingPointError):
+    """A numerical failure at an identified valid observation of a record."""
+
+    def __init__(self, frame, error):
+        self.frame_index = frame.index
+        self.time_sec = frame.time_sec
+        self.cause_type = type(error).__name__
+        super().__init__(str(error))
+
+
 def observation_frames(times_sec, valid_mask, init_time_sec):
     """Yield each valid arrival, including the last one, using the previous valid epoch."""
     times = torch.as_tensor(times_sec).detach().to(device="cpu", dtype=torch.float64).numpy()

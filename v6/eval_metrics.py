@@ -8,6 +8,8 @@ Implements the complete co-signed evaluation specification across:
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
@@ -37,11 +39,18 @@ class RecordEvalRow:
     diverged: bool
     prior_pos_rmse_km: float | None = None
     observation_nll: float | None = None
+    posterior_nll_si: float | None = None
+    reference_nll_si: float | None = None
     valid_frames: int = 0
     eligible_prior_epochs: int = 0
     newly_harmed_epochs: int = 0
     failed_proposals: int = 0
     attempted_batches: int = 0
+    initialization: str = "supplied"
+    posterior_hpd90_rate: float | None = None
+    los_cone90_rate: float | None = None
+    los_error_rad: float | None = None
+    failure: dict | None = None
 
 
 def compute_los_local_errors(
@@ -127,6 +136,21 @@ def directional_benefit_metrics(
     }
 
 
+def metrics_json(summary, *, indent=None):
+    """Represent undefined or infinite statistics as JSON null; failure counts carry their meaning."""
+
+    def clean(x):
+        if isinstance(x, dict):
+            return {k: clean(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [clean(v) for v in x]
+        if isinstance(x, float) and not math.isfinite(x):
+            return None
+        return x
+
+    return json.dumps(clean(summary), indent=indent, allow_nan=False)
+
+
 def _distribution_summary(values: np.ndarray, cap_for_diverged: float) -> dict[str, float]:
     """Compute mean, P50, P90, P95, P99, and worst-1% CVaR-99% while keeping failures in denominator."""
     if values.size == 0:
@@ -146,6 +170,10 @@ def _distribution_summary(values: np.ndarray, cap_for_diverged: float) -> dict[s
     finite_only = values[np.isfinite(values)]
     raw_mean = float(np.mean(finite_only)) if finite_only.size == values.size else float("inf")
     return {
+        "cap": cap_for_diverged,
+        "finite_count": int(len(finite_only)),
+        "finite_only_p50": float(np.quantile(finite_only, 0.5)) if len(finite_only) else None,
+        "finite_only_p95": float(np.quantile(finite_only, 0.95)) if len(finite_only) else None,
         "raw_mean": raw_mean,
         "capped_mean": float(np.mean(capped)),
         "p50": float(np.quantile(capped, 0.50)),
@@ -173,8 +201,11 @@ def summarize_record_rows(
         pos = np.array([r.pos_rmse_km if r.is_finite else np.inf for r in subset], dtype=np.float64)
         vel = np.array([r.vel_rmse_mps if r.is_finite else np.inf for r in subset], dtype=np.float64)
         smse = np.array([r.scaled_mse if r.is_finite else np.inf for r in subset], dtype=np.float64)
-        last_v = np.array([r.last_frame_vel_mps for r in subset], dtype=np.float64)
-        last_r = np.array([abs(r.last_frame_radial_pos_km) for r in subset], dtype=np.float64)
+        last = [
+            r for r in subset if r.last_frame_vel_mps is not None and r.last_frame_radial_pos_km is not None
+        ]
+        last_v = np.array([r.last_frame_vel_mps for r in last], dtype=np.float64)
+        last_r = np.array([abs(r.last_frame_radial_pos_km) for r in last], dtype=np.float64)
         nonfinite_rate = float(np.mean([not r.is_finite for r in subset]))
         diverged_rate = float(np.mean([r.diverged or (not r.is_finite) for r in subset]))
 
@@ -194,8 +225,11 @@ def summarize_record_rows(
                 pos, cap_for_diverged=max(divergence_pos_km * 10.0, 10000.0)
             ),
             "velocity_mps": _distribution_summary(vel, cap_for_diverged=10000.0),
-            "last_frame_vel_mps": _distribution_summary(last_v, cap_for_diverged=10000.0),
-            "last_frame_radial_pos_km": _distribution_summary(last_r, cap_for_diverged=10000.0),
+            "last_frame_count": len(last),
+            "last_frame_vel_mps": _distribution_summary(last_v, cap_for_diverged=10000.0) if last else None,
+            "last_frame_radial_pos_km": _distribution_summary(last_r, cap_for_diverged=10000.0)
+            if last
+            else None,
             "good_orbit_lt10km_new_harm_rate": harmed / eligible if eligible else None,
             "good_orbit_eligible_epochs": eligible,
             "good_orbit_new_harm_epochs": harmed,
@@ -210,6 +244,18 @@ def summarize_record_rows(
             out["observation_nll"] = sum(r.observation_nll * r.valid_frames for r in noise_rows) / sum(
                 r.valid_frames for r in noise_rows
             )
+        density_rows = [row for row in subset if row.posterior_nll_si is not None]
+        if density_rows:
+            n = sum(row.valid_frames for row in density_rows)
+            for name in ("posterior_nll_si", "reference_nll_si"):
+                out[name] = sum(getattr(row, name) * row.valid_frames for row in density_rows) / n
+        for metric in ("posterior_hpd90_rate", "los_cone90_rate", "los_error_rad"):
+            scored = [r for r in subset if getattr(r, metric) is not None]
+            if scored:
+                n = sum(r.valid_frames for r in scored)
+                out[metric] = sum(getattr(r, metric) * r.valid_frames for r in scored) / n
+                out[metric + "_frames"] = n
+        out["failed_records"] = sum(r.failure is not None for r in subset)
         return out
 
     by_cadence = {
@@ -242,6 +288,9 @@ def summarize_record_rows(
 
     return {
         "overall": _agg(rows),
+        "failures": [
+            dict(record_id=r.record_id, source_id=r.source_id, **r.failure) for r in rows if r.failure
+        ],
         "by_cadence": by_cadence,
         "by_b0_stratum": by_stratum,
         "source_equal_summary": {
@@ -261,45 +310,63 @@ def cluster_paired_bootstrap_ci(
     *,
     metric: str = "pos_rmse_km",
     mode: str = "difference",  # "difference" (cand - base) or "ratio" (cand / base)
+    statistic: str = "mean",
+    cap: float = 10000.0,
     n_boot: int = 2000,
     seed: int = 20261028,
 ) -> dict[str, float]:
     """Cluster-paired bootstrap over independent source_id units (JOINT_RESEARCH_PLAN §4.5)."""
+    if mode not in ("difference", "ratio") or statistic not in ("mean", "p50", "p95"):
+        raise ValueError("Choose difference/ratio and mean/p50/p95")
     cand_map = {r.record_id: r for r in candidate_rows}
     base_map = {r.record_id: r for r in baseline_rows}
-    shared_ids = sorted(set(cand_map).intersection(base_map))
+    if len(cand_map) != len(candidate_rows) or len(base_map) != len(baseline_rows):
+        raise ValueError("Duplicate record ID in paired comparison")
+    shared_ids = sorted(cand_map.keys() & base_map.keys())
     if not shared_ids:
         raise ValueError("No shared record_ids between candidate and baseline")
-
-    clusters: dict[str, list[tuple[float, float]]] = {}
+    clusters = {}
     for rid in shared_ids:
-        rc, rb = cand_map[rid], base_map[rid]
-        vc = float(getattr(rc, metric)) if rc.is_finite and getattr(rc, metric) is not None else 10000.0
-        vb = float(getattr(rb, metric)) if rb.is_finite and getattr(rb, metric) is not None else 10000.0
-        clusters.setdefault(rc.source_id, []).append((vc, vb))
+        left, right = cand_map[rid], base_map[rid]
+        if (left.source_id, left.cadence, left.initialization, left.valid_frames) != (
+            right.source_id,
+            right.cadence,
+            right.initialization,
+            right.valid_frames,
+        ):
+            raise ValueError(
+                f"Paired records have different source, cadence, initialization or frames: {rid}"
+            )
 
-    source_keys = sorted(clusters)
-    n_sources = len(source_keys)
-    cluster_sums = np.array(
-        [[sum(p[0] for p in clusters[s]), sum(p[1] for p in clusters[s]), len(clusters[s])] for s in source_keys],
-        dtype=np.float64,
-    )
+        def value(row):
+            v = getattr(row, metric)
+            return min(float(v), cap) if row.is_finite and v is not None and np.isfinite(v) else cap
 
-    def _stat(arr: np.ndarray) -> float:
-        tot_c, tot_b, tot_n = arr[:, 0].sum(), arr[:, 1].sum(), max(1.0, arr[:, 2].sum())
-        mc, mb = tot_c / tot_n, tot_b / tot_n
-        if mode == "ratio":
-            return float(mc / max(mb, 1.0e-12))
-        return float(mc - mb)
+        clusters.setdefault(left.source_id, []).append((value(left), value(right)))
+    groups = [np.array(clusters[k]) for k in sorted(clusters)]
+    n_sources = len(groups)
 
-    point = _stat(cluster_sums)
+    def compare(array):
+        a, b = (
+            array.mean(axis=0)
+            if statistic == "mean"
+            else np.quantile(array, 0.5 if statistic == "p50" else 0.95, axis=0)
+        )
+        if mode == "ratio" and b == 0:
+            raise ValueError("Quantile or mean ratio is undefined for a zero baseline")
+        return float(a - b if mode == "difference" else a / b)
+
+    point = compare(np.concatenate(groups))
     rng = np.random.default_rng(seed)
     samples = np.empty(int(n_boot), dtype=np.float64)
-    for b in range(int(n_boot)):
-        idx = rng.integers(0, n_sources, size=n_sources)
-        samples[b] = _stat(cluster_sums[idx])
-
+    for i in range(len(samples)):
+        draw = rng.integers(n_sources, size=n_sources)
+        samples[i] = compare(np.concatenate([groups[j] for j in draw]))
     return {
+        "statistic": statistic,
+        "cap": cap,
+        "candidate_only": len(cand_map) - len(shared_ids),
+        "baseline_only": len(base_map) - len(shared_ids),
         "point_estimate": point,
         "ci95_low": float(np.quantile(samples, 0.025)),
         "ci95_high": float(np.quantile(samples, 0.975)),
@@ -328,6 +395,7 @@ def measure_secant_amplification(
 
 __all__ = [
     "RecordEvalRow",
+    "metrics_json",
     "cluster_paired_bootstrap_ci",
     "compute_los_local_errors",
     "directional_benefit_metrics",
