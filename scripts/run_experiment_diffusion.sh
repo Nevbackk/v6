@@ -21,7 +21,7 @@
 #   LR=0.001
 #   SEEDS="20261028 20261029 20261030"
 #   SPLIT_SEED=20261028
-#   STAGE=all   (all | test | main | k_curve | abl_guidance | abl_budget_delta | b1 | b2 | paired_val)
+#   STAGE=main   (all | test | main | k_curve | abl_guidance | abl_budget_delta | b1 | b2 | paired_val)
 #   RUN_PAIRED_VAL=0   (set 1 ONLY after locking model choices on dev_select!)
 # ==============================================================================
 
@@ -43,7 +43,7 @@ BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-0.001}"
 SEEDS_STR="${SEEDS:-20261028 20261029 20261030}"
 SPLIT_SEED="${SPLIT_SEED:-20261028}"
-STAGE="${STAGE:-all}"
+STAGE="${STAGE:-main}"
 MAX_RECORDS_PER_EPOCH="${MAX_RECORDS_PER_EPOCH:-0}"
 MAX_EVAL_RECORDS="${MAX_EVAL_RECORDS:-0}"
 RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"

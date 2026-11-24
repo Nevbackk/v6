@@ -13,7 +13,7 @@
 #   EPOCHS=10                      (default: 10)
 #   BATCH_SIZE=32                  (default: 32)
 #   SEEDS="20261028 20261029 20261030"
-#   STAGE=all                      (all | test | main | classical | abl_3x2 | ltr_lm | fd_asf | paired_val)
+#   STAGE=main                      (all | test | main | classical | abl_3x2 | ltr_lm | fd_asf | paired_val)
 #   MAX_RECORDS_PER_EPOCH=0        (0 = full TRAIN-fit; >0 = fast pilot cap, e.g. 512)
 #   MAX_EVAL_RECORDS=0             (0 = full DEV-select / VAL; >0 = fast pilot cap)
 #   RUN_PAIRED_VAL=0               (set 1 ONLY after locking model choices on dev_select!)
@@ -36,7 +36,7 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-0.001}"
 SEEDS_STR="${SEEDS:-20261028 20261029 20261030}"
-STAGE="${STAGE:-all}"
+STAGE="${STAGE:-main}"
 MAX_RECORDS_PER_EPOCH="${MAX_RECORDS_PER_EPOCH:-0}"
 MAX_EVAL_RECORDS="${MAX_EVAL_RECORDS:-0}"
 RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"

@@ -35,7 +35,7 @@ EPOCHS="${EPOCHS:-10}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 LR="${LR:-0.001}"
 SEEDS_STR="${SEEDS:-20261028 20261029 20261030}"
-STAGE="${STAGE:-all}"
+STAGE="${STAGE:-main}"
 MAX_RECORDS_PER_EPOCH="${MAX_RECORDS_PER_EPOCH:-0}"
 MAX_EVAL_RECORDS="${MAX_EVAL_RECORDS:-0}"
 RUN_PAIRED_VAL="${RUN_PAIRED_VAL:-0}"
@@ -100,7 +100,6 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "asd_sc" ]]; then
       "${COMMON_ARGS[@]}" \
       --run-dir "${RUN_DIR}" \
       --ablation-mode full \
-
       --lambda-forecast 1.0 \
       --lambda-prog 0.25 \
       --lambda-good-harm 2.0 \
@@ -195,7 +194,6 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl4_horizon_prog" ]]; then
     "${COMMON_ARGS[@]}" \
     --run-dir "${OUTPUT_ROOT}/abl4_horizon_prog/current_only_seed_${ABL_SEED}" \
     --ablation-mode full \
-
     --lambda-forecast 0.0 \
     --seed "${ABL_SEED}" \
     --eval-split dev_select
@@ -205,7 +203,6 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "abl4_horizon_prog" ]]; then
     "${COMMON_ARGS[@]}" \
     --run-dir "${OUTPUT_ROOT}/abl4_horizon_prog/next_frame_seed_${ABL_SEED}" \
     --ablation-mode full \
-
     --lambda-forecast 1.0 \
     --seed "${ABL_SEED}" \
     --eval-split dev_select

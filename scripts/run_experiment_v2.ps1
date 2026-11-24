@@ -19,7 +19,7 @@ param(
     [int]$AblSeed = $Seeds[0],
     [int]$SplitSeed = $(if ($env:SPLIT_SEED) { [int]$env:SPLIT_SEED } else { 20261028 }),
     [ValidateSet("all", "test", "main", "asd_sc", "abl1_synergy", "abl2_gate", "abl3_replay_unroll", "abl4_horizon_prog", "abl5_memory_reanchor", "paired_val")]
-    [string]$Stage = "all",
+    [string]$Stage = "main",
     [int]$MaxRecordsPerEpoch = 0,
     [int]$MaxEvalRecords = 0,
     [string]$SensorCheckpoint = $env:SENSOR_CHECKPOINT,

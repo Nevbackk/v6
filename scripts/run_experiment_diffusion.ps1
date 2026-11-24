@@ -19,7 +19,7 @@ param(
     [int]$AblSeed = $Seeds[0],
     [int]$SplitSeed = 20261028,
     [ValidateSet("all", "test", "main", "k_curve", "abl_guidance", "abl_budget_delta", "b1", "b2", "paired_val", "paired_b1", "paired_b2")]
-    [string]$Stage = "all",
+    [string]$Stage = "main",
     [int]$MaxRecordsPerEpoch = 0,
     [int]$MaxEvalRecords = 0,
     [switch]$RunPairedVal

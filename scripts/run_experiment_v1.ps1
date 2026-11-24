@@ -18,7 +18,7 @@ param(
     [int[]]$Seeds = @(20261028, 20261029, 20261030),
     [int]$SplitSeed = $(if ($env:SPLIT_SEED) { [int]$env:SPLIT_SEED } else { 20261028 }),
     [ValidateSet("all", "test", "main", "classical", "abl_3x2", "ltr_lm", "fd_asf", "paired_val")]
-    [string]$Stage = "all",
+    [string]$Stage = "main",
     [int]$MaxRecordsPerEpoch = 0,
     [int]$MaxEvalRecords = 0,
     [switch]$RunPairedVal
