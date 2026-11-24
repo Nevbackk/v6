@@ -59,12 +59,37 @@ class Prepared:
         if (set(self.rows) != keys or set(initial) != set(allowed)
                 or len(keys) != config[f"{split}_records"]):
             raise ValueError(f"Incomplete frozen {split} snapshot")
+        self._initial_truth = {}
+        self._initial_epoch = {source: b0[0] for source, b0 in initial.items()}
+        self._initial_station = {}
         self.shard = lru_cache(maxsize=16)(self._load_shard)
 
     def _load_shard(self, sid):
         path = self.root / "prepared_cache" / self.split / "shards" / f"shard_{sid:06d}.pt"
         records = torch.load(path, map_location="cpu", weights_only=False)["records"]
         indexed = {identity(row): row for row in records}
+        for row in records:
+            source, rhythm, _ = identity(row)
+            key = (sid, source)
+            if key not in self._initial_epoch or not len(row["t"]):
+                continue
+            epoch = self._initial_epoch[key]
+            raw_times = np.asarray(row["t"], dtype=np.float64)
+            i = int(np.searchsorted(raw_times, epoch, side="right")) - 1
+            if i < 0:
+                continue
+            sample_time = float(raw_times[i])
+            # All cadence variants share the same initialization. Use the latest
+            # ground truth already available at that epoch for the clean control.
+            if key not in self._initial_truth or sample_time > self._initial_truth[key][0]:
+                self._initial_truth[key] = (
+                    sample_time,
+                    np.asarray(row["tgt_state"][i], dtype=np.float64).copy(),
+                )
+            if rhythm == "dense":
+                station = np.asarray(row["sat_state"][i], dtype=np.float64).copy()
+                station[:3] += station[3:] * (epoch - sample_time)
+                self._initial_station[key] = station
         if len(indexed) != len(records):
             raise ValueError(f"Duplicate records in {path}")
         return indexed
@@ -72,7 +97,7 @@ class Prepared:
     def length(self, key):
         return int(self.rows[key]["filter_observation_count"])
 
-    def record(self, key):
+    def record(self, key, *, exact_initial=False):
         init = self.rows[key]
         row = self.shard(int(init["shard_id"]))[identity(init["record_key"])]
         t = np.asarray(row["t"], dtype=np.float64)
@@ -82,12 +107,37 @@ class Prepared:
                 or len(t) - start != self.length(key)
                 or not np.isfinite(t).all() or (np.diff(t) <= 0).any()):
             raise ValueError(f"Invalid observation times for {key}")
-        return dict(initial_state_si=init["initial_state"], init_time_sec=epoch,
-                    times_sec=t[start:], observed_los=np.asarray(row["los"])[start:],
-                    station_states_si=np.asarray(row["sat_state"])[start:],
-                    station_ids=np.asarray(row["sat_id"])[start:],
-                    station_id_reliable=np.ones(len(t) - start, dtype=bool),
-                    truth_states_si=np.asarray(row["tgt_state"])[start:])
+        source = (int(init["shard_id"]), identity(init["record_key"])[0])
+        initial_state = init["initial_state"]
+        if exact_initial:
+            if "initial_truth_state_si" in init:
+                initial_state = init["initial_truth_state_si"]
+            elif source in self._initial_truth:
+                from ..models.reprojection import propagate_si_with_stm
+
+                sample_time, state = self._initial_truth[source]
+                initial_state = propagate_si_with_stm(
+                    torch.as_tensor(state), epoch - sample_time, compute_stm=False
+                )[0].numpy()
+            else:
+                raise ValueError(
+                    f"V1 needs a known six-dimensional truth state at or before initialization: {key}"
+                )
+            initial_state = np.asarray(initial_state, dtype=np.float64)
+            if initial_state.shape != (6,) or not np.isfinite(initial_state).all():
+                raise ValueError(f"Invalid known initial state: {key}")
+        return dict(
+            initial_state_si=initial_state,
+            init_time_sec=epoch,
+            initialization="known_state" if exact_initial else "gauss_ls",
+            initial_station_si=self._initial_station.get(source),
+            times_sec=t[start:],
+            observed_los=np.asarray(row["los"])[start:],
+            station_states_si=np.asarray(row["sat_state"])[start:],
+            station_ids=np.asarray(row["sat_id"])[start:],
+            station_id_reliable=np.ones(len(t) - start, dtype=bool),
+            truth_states_si=np.asarray(row["tgt_state"])[start:],
+        )
 
     def collate(self, keys):
         records = [self.record(key) for key in keys]

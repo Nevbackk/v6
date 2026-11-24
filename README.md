@@ -76,3 +76,44 @@ The shared source incorporates the Direct run's dual-mode integration and the
 Gain path's exact-geometry blockwise backend. The two-body RK4 batch implementation
 is shared by the portable model; the serial adapter uses it for a single track.
 No KalmanNet network or experiment infrastructure is needed at runtime.
+
+## Per-frame orbit estimation
+
+V1 learns the angular sensor from a known initial state. V2 starts at the supplied noisy Gauss–LS estimate and updates **one normalized six-dimensional probability density** on each valid LOS arrival. Both use the actual elapsed time, known station state and deterministic two-body dynamics. Batch replay calls the same per-frame recursion as a live stream.
+
+| Entry point | Orbit state carried between observations | What each arrival contributes |
+| --- | --- | --- |
+| `scripts/train_v1.py` | A known state propagated by RK4 | A predictive angular bias and covariance from a learned reverse Markov chain, followed by a sensor innovation and score. |
+| `scripts/train_v2.py` (default `--arch ppc`) | One invertible spline density with a physical reference, a full-rank factor and 150 shape coefficients | One reference orbit and its first two variations propagate the previous shape. A QR update absorbs the local Gaussian information. The remaining spherical likelihood changes the shape and relative mass within that same density. |
+
+For V2, call `state = model.start_track(x0, t0)` once and `result = model.step(state, tk, los, station)` at each arrival. `result["distribution"].log_prob(x_si)` gives the full state log density in SI units. `model.readout(state.posterior)` returns quadrature estimates of the mean, covariance and marginal intervals. Integration nodes serve individual integrals and carry no trajectory identity.
+
+The default sensor uses four cosine VP reverse transitions. Within V2, `--K` also sets the number of fractional likelihood updates whose powers sum to one. `--P` controls angular sampling and the number of CFM training pairs, `--warp-nodes` sets the integration rule per reference chart, and `--unroll-frames` sets the training gradient span. Physical propagation always uses the observation timestamps.
+
+```bash
+python scripts/train_v1.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v1
+python scripts/train_v2.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v2 --sensor-checkpoint runs/v1/best.pt
+python scripts/validate_v2.py --prepared-root /path/to/prepared --protocol-dir /path/to/protocol --run-dir runs/v2 --eval-split paired_val
+```
+
+V1 selects on held-out angular Gaussian moment NLL. V2 selects on source-equal full-record scaled MSE. Evaluation also reports failed records, the four sampling cadences, initialization strata, six-dimensional density and 90% highest-density coverage, and the next observed LOS predictive score and cone coverage for PPC and its Gaussian controls. Sensor transfer requires the same source split and sensor model. The main Bash and PowerShell V2 runners save under `ppc/seed_*`.
+
+## Matched controls and CPU checks
+
+| Option | What it measures |
+| --- | --- |
+| `train_v2.py --arch qr --observation-model calibrated` | Classical local Gaussian reference with causal angular calibration. |
+| `train_v2.py --arch gaussian --observation-model direct` | Same nonlinear evidence and quadrature as PPC, projected onto one Gaussian. |
+| `train_v2.py --arch ppc --observation-model direct` | Direct heteroscedastic sensor moments in place of the angular diffusion chain. |
+| `train_v1.py --arch cl_full_prefix_wls --initialization gauss_ls` | Causal full-prefix least squares starting from the same noisy initial state as V2. |
+| `train_v2.py --arch diffusion` | Previous state VP/VJP filter. Archived ASD-SC and B1/B2 experiments have their own explicit entries. |
+
+On a controlled range slice with two positive solutions near 4,200 and 8,358 km, three independently trained splines assigned 2.58–3.00% to the interval between the peaks, compared with 34.56% for the matched projected Gaussian. The reference grid assigns about 0.00000085%. This experiment isolates shape estimation in one physical dimension with five Gaussian nuisance coordinates. Full G4 orbit accuracy and good-initial-orbit performance require the corresponding data evaluation.
+
+```bash
+python scripts/check_ppc_two_ranges.py --seed 17 --iterations 500 --output range.json --figure range.png
+python scripts/profile_frame_filter.py --arch ppc
+python -s -m unittest discover -s tests -v
+```
+
+The physical prediction uses a local second-order approximation. The shipping estimator takes an external initial state. Detailed equations, sensor alternatives, training losses and experiment definitions appear in the [method description](docs/METHODS_V1_V2_CN.md).

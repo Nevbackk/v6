@@ -1,0 +1,404 @@
+"""Stratified evaluation protocol, paired bootstrap CIs, and V2 stability/endpoint audits.
+
+Implements the complete co-signed evaluation specification across:
+- docs/JOINT_RESEARCH_PLAN.md (§4–§5)
+- docs/FLAGSHIP_ACLASS_PROPOSAL.md (§3–§4)
+- docs/MODEL_V2_ADAPTIVE_DENOISING_PLAN.md (§3–§4)
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from typing import Any, Callable, Sequence
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from .data.splits import B0_ERROR_STRATA_KM, CADENCE_NAMES, b0_stratum_label
+from .models.batched_physics import STATE_SCALE_VALUES
+from .models.reprojection import build_los_frame
+
+
+@dataclass(frozen=True)
+class RecordEvalRow:
+    """Per-record summary for full-table, per-cadence, source-equal, and paired bootstrap stats."""
+
+    record_id: str
+    source_id: str
+    cadence: str
+    b0_pos_error_km: float
+    pos_rmse_km: float
+    vel_rmse_mps: float
+    scaled_mse: float
+    last_frame_vel_mps: float | None
+    last_frame_radial_pos_km: float | None
+    is_finite: bool
+    diverged: bool
+    prior_pos_rmse_km: float | None = None
+    observation_nll: float | None = None
+    posterior_nll_si: float | None = None
+    reference_nll_si: float | None = None
+    valid_frames: int = 0
+    eligible_prior_epochs: int = 0
+    newly_harmed_epochs: int = 0
+    failed_proposals: int = 0
+    attempted_batches: int = 0
+    initialization: str = "supplied"
+    posterior_hpd90_rate: float | None = None
+    los_cone90_rate: float | None = None
+    los_error_rad: float | None = None
+    failure: dict | None = None
+
+
+def compute_los_local_errors(
+    pred_state_si: Tensor,
+    truth_state_si: Tensor,
+    station_state_si: Tensor,
+) -> dict[str, Tensor]:
+    """Decompose 6D state error (pred - truth) into LOS-radial and two transverse axes."""
+    rel_true = truth_state_si[..., :3] - station_state_si[..., :3]
+    U_true, _ = build_los_frame(rel_true)
+    u_r = U_true[..., :, 0]
+    q1 = U_true[..., :, 1]
+    q2 = U_true[..., :, 2]
+
+    err_r_km = (pred_state_si[..., :3] - truth_state_si[..., :3]) / 1000.0
+    err_v_mps = pred_state_si[..., 3:] - truth_state_si[..., 3:]
+
+    r_R = (err_r_km * u_r).sum(dim=-1)
+    r_T1 = (err_r_km * q1).sum(dim=-1)
+    r_T2 = (err_r_km * q2).sum(dim=-1)
+    r_T = torch.hypot(r_T1, r_T2)
+
+    v_R = (err_v_mps * u_r).sum(dim=-1)
+    v_T1 = (err_v_mps * q1).sum(dim=-1)
+    v_T2 = (err_v_mps * q2).sum(dim=-1)
+    v_T = torch.hypot(v_T1, v_T2)
+
+    return {
+        "r_R_km": r_R,
+        "r_T1_km": r_T1,
+        "r_T2_km": r_T2,
+        "r_T_km": r_T,
+        "v_R_mps": v_R,
+        "v_T1_mps": v_T1,
+        "v_T2_mps": v_T2,
+        "v_T_mps": v_T,
+    }
+
+
+def directional_benefit_metrics(
+    needed_delta_scaled: Tensor,
+    proposed_delta_scaled: Tensor,
+    *,
+    zero_tol: float = 1.0e-12,
+    truth_tol: float = 1.0e-9,
+) -> dict[str, float]:
+    """Selection-bias-free 3-metric directional alignment report (JOINT_RESEARCH_PLAN §4.3).
+
+    Reports simultaneously:
+    1. zero_step_fraction: fraction of anchors with ||c|| <= zero_tol
+    2. nonzero_cosine_p50: median cos(d, c) among nonzero steps
+    3. all_anchor_positive_benefit_rate: fraction of all nonzero-error anchors with
+       B(d, c) = 2 d^T c - ||c||^2 > 0
+    """
+    d = needed_delta_scaled.reshape(-1, needed_delta_scaled.shape[-1]).to(torch.float64)
+    c = proposed_delta_scaled.reshape(-1, proposed_delta_scaled.shape[-1]).to(torch.float64)
+    d_norm = torch.linalg.vector_norm(d, dim=-1)
+    c_norm = torch.linalg.vector_norm(c, dim=-1)
+
+    is_zero_step = c_norm <= float(zero_tol)
+    zero_frac = float(is_zero_step.to(torch.float64).mean().item()) if c.shape[0] > 0 else 0.0
+
+    nonzero_mask = (~is_zero_step) & (d_norm > float(truth_tol))
+    if bool(nonzero_mask.any()):
+        cos_vals = (d[nonzero_mask] * c[nonzero_mask]).sum(dim=-1) / (
+            d_norm[nonzero_mask] * c_norm[nonzero_mask]
+        )
+        cos_p50 = float(torch.quantile(cos_vals, 0.5).item())
+    else:
+        cos_p50 = 0.0
+
+    valid_truth = d_norm > float(truth_tol)
+    if bool(valid_truth.any()):
+        benefit = 2.0 * (d[valid_truth] * c[valid_truth]).sum(dim=-1) - c_norm[valid_truth].square()
+        pos_benefit_rate = float((benefit > 0.0).to(torch.float64).mean().item())
+    else:
+        pos_benefit_rate = 0.0
+
+    return {
+        "zero_step_fraction": zero_frac,
+        "nonzero_cosine_p50": cos_p50,
+        "all_anchor_positive_benefit_rate": pos_benefit_rate,
+    }
+
+
+def metrics_json(summary, *, indent=None):
+    """Represent undefined or infinite statistics as JSON null; failure counts carry their meaning."""
+
+    def clean(x):
+        if isinstance(x, dict):
+            return {k: clean(v) for k, v in x.items()}
+        if isinstance(x, list):
+            return [clean(v) for v in x]
+        if isinstance(x, float) and not math.isfinite(x):
+            return None
+        return x
+
+    return json.dumps(clean(summary), indent=indent, allow_nan=False)
+
+
+def _distribution_summary(values: np.ndarray, cap_for_diverged: float) -> dict[str, float]:
+    """Compute mean, P50, P90, P95, P99, and worst-1% CVaR-99% while keeping failures in denominator."""
+    if values.size == 0:
+        return {
+            "mean": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "cvar99": 0.0,
+        }
+    capped = np.where(np.isfinite(values), np.minimum(values, cap_for_diverged), cap_for_diverged)
+    p99 = float(np.quantile(capped, 0.99))
+    tail_count = max(1, int(np.ceil(0.01 * capped.size)))
+    sorted_vals = np.sort(capped)
+    cvar99 = float(np.mean(sorted_vals[-tail_count:]))
+    finite_only = values[np.isfinite(values)]
+    raw_mean = float(np.mean(finite_only)) if finite_only.size == values.size else float("inf")
+    return {
+        "cap": cap_for_diverged,
+        "finite_count": int(len(finite_only)),
+        "finite_only_p50": float(np.quantile(finite_only, 0.5)) if len(finite_only) else None,
+        "finite_only_p95": float(np.quantile(finite_only, 0.95)) if len(finite_only) else None,
+        "raw_mean": raw_mean,
+        "capped_mean": float(np.mean(capped)),
+        "p50": float(np.quantile(capped, 0.50)),
+        "p90": float(np.quantile(capped, 0.90)),
+        "p95": float(np.quantile(capped, 0.95)),
+        "p99": p99,
+        "cvar99": cvar99,
+    }
+
+
+def summarize_record_rows(
+    rows: Sequence[RecordEvalRow],
+    *,
+    divergence_pos_km: float = 1000.0,
+    good_orbit_harm_threshold_km: float = 20.0,
+) -> dict[str, Any]:
+    """Produce overall, 4-cadence, source-equal, and 5-stratum tables from RecordEvalRow items."""
+    if not rows:
+        return {"count": 0}
+
+    def _agg(subset: Sequence[RecordEvalRow]) -> dict[str, Any]:
+        n = len(subset)
+        if n == 0:
+            return {"count": 0}
+        pos = np.array([r.pos_rmse_km if r.is_finite else np.inf for r in subset], dtype=np.float64)
+        vel = np.array([r.vel_rmse_mps if r.is_finite else np.inf for r in subset], dtype=np.float64)
+        smse = np.array([r.scaled_mse if r.is_finite else np.inf for r in subset], dtype=np.float64)
+        last = [
+            r for r in subset if r.last_frame_vel_mps is not None and r.last_frame_radial_pos_km is not None
+        ]
+        last_v = np.array([r.last_frame_vel_mps for r in last], dtype=np.float64)
+        last_r = np.array([abs(r.last_frame_radial_pos_km) for r in last], dtype=np.float64)
+        nonfinite_rate = float(np.mean([not r.is_finite for r in subset]))
+        diverged_rate = float(np.mean([r.diverged or (not r.is_finite) for r in subset]))
+
+        good_sub = [r for r in subset if 0.0 <= r.b0_pos_error_km < 10.0]
+        eligible = sum(r.eligible_prior_epochs for r in good_sub)
+        harmed = sum(r.newly_harmed_epochs for r in good_sub)
+
+        noise_rows = [r for r in subset if r.observation_nll is not None]
+        out: dict[str, Any] = {
+            "count": n,
+            "nonfinite_rate": nonfinite_rate,
+            "diverged_rate_gt_1000km": diverged_rate,
+            "scaled_mse_finite_mean": float(np.mean(smse[np.isfinite(smse)]))
+            if np.isfinite(smse).any()
+            else float("inf"),
+            "position_km": _distribution_summary(
+                pos, cap_for_diverged=max(divergence_pos_km * 10.0, 10000.0)
+            ),
+            "velocity_mps": _distribution_summary(vel, cap_for_diverged=10000.0),
+            "last_frame_count": len(last),
+            "last_frame_vel_mps": _distribution_summary(last_v, cap_for_diverged=10000.0) if last else None,
+            "last_frame_radial_pos_km": _distribution_summary(last_r, cap_for_diverged=10000.0)
+            if last
+            else None,
+            "good_orbit_lt10km_new_harm_rate": harmed / eligible if eligible else None,
+            "good_orbit_eligible_epochs": eligible,
+            "good_orbit_new_harm_epochs": harmed,
+            "attempted_proposal_batches": sum(r.attempted_batches for r in subset),
+            "failed_proposal_batches": sum(r.failed_proposals for r in subset),
+        }
+        frames = sum(r.valid_frames for r in subset)
+        out["valid_frames"] = frames
+        if frames:
+            out["scaled_mse_pooled"] = sum(r.scaled_mse*r.valid_frames for r in subset if r.valid_frames) / frames
+        if noise_rows:
+            out["observation_nll"] = sum(r.observation_nll * r.valid_frames for r in noise_rows) / sum(
+                r.valid_frames for r in noise_rows
+            )
+        density_rows = [row for row in subset if row.posterior_nll_si is not None]
+        if density_rows:
+            n = sum(row.valid_frames for row in density_rows)
+            for name in ("posterior_nll_si", "reference_nll_si"):
+                out[name] = sum(getattr(row, name) * row.valid_frames for row in density_rows) / n
+        for metric in ("posterior_hpd90_rate", "los_cone90_rate", "los_error_rad"):
+            scored = [r for r in subset if getattr(r, metric) is not None]
+            if scored:
+                n = sum(r.valid_frames for r in scored)
+                out[metric] = sum(getattr(r, metric) * r.valid_frames for r in scored) / n
+                out[metric + "_frames"] = n
+        out["failed_records"] = sum(r.failure is not None for r in subset)
+        return out
+
+    by_cadence = {
+        cad: _agg([r for r in rows if r.cadence == cad])
+        for cad in CADENCE_NAMES
+    }
+    by_stratum = {
+        label: _agg([r for r in rows if b0_stratum_label(r.b0_pos_error_km) == label])
+        for _, _, label in B0_ERROR_STRATA_KM
+    }
+
+    # Source-equal aggregation (each unique source_id weighted equally regardless of frame count)
+    source_buckets: dict[str, list[RecordEvalRow]] = {}
+    for r in rows:
+        source_buckets.setdefault(r.source_id, []).append(r)
+    source_means_pos = np.array(
+        [
+            np.mean([x.pos_rmse_km if x.is_finite else 10000.0 for x in grp])
+            for grp in source_buckets.values()
+        ],
+        dtype=np.float64,
+    )
+    source_means_vel = np.array(
+        [
+            np.mean([x.vel_rmse_mps if x.is_finite else 10000.0 for x in grp])
+            for grp in source_buckets.values()
+        ],
+        dtype=np.float64,
+    )
+
+    return {
+        "overall": _agg(rows),
+        "failures": [
+            dict(record_id=r.record_id, source_id=r.source_id, **r.failure) for r in rows if r.failure
+        ],
+        "by_cadence": by_cadence,
+        "by_b0_stratum": by_stratum,
+        "source_equal_summary": {
+            "unique_sources": len(source_buckets),
+            "scaled_mse": float(
+                np.mean([np.mean([r.scaled_mse for r in grp]) for grp in source_buckets.values()])
+            ),
+            "position_km": _distribution_summary(source_means_pos, cap_for_diverged=10000.0),
+            "velocity_mps": _distribution_summary(source_means_vel, cap_for_diverged=10000.0),
+        },
+    }
+
+
+def cluster_paired_bootstrap_ci(
+    candidate_rows: Sequence[RecordEvalRow],
+    baseline_rows: Sequence[RecordEvalRow],
+    *,
+    metric: str = "pos_rmse_km",
+    mode: str = "difference",  # "difference" (cand - base) or "ratio" (cand / base)
+    statistic: str = "mean",
+    cap: float = 10000.0,
+    n_boot: int = 2000,
+    seed: int = 20261028,
+) -> dict[str, float]:
+    """Cluster-paired bootstrap over independent source_id units (JOINT_RESEARCH_PLAN §4.5)."""
+    if mode not in ("difference", "ratio") or statistic not in ("mean", "p50", "p95"):
+        raise ValueError("Choose difference/ratio and mean/p50/p95")
+    cand_map = {r.record_id: r for r in candidate_rows}
+    base_map = {r.record_id: r for r in baseline_rows}
+    if len(cand_map) != len(candidate_rows) or len(base_map) != len(baseline_rows):
+        raise ValueError("Duplicate record ID in paired comparison")
+    shared_ids = sorted(cand_map.keys() & base_map.keys())
+    if not shared_ids:
+        raise ValueError("No shared record_ids between candidate and baseline")
+    clusters = {}
+    for rid in shared_ids:
+        left, right = cand_map[rid], base_map[rid]
+        if (left.source_id, left.cadence, left.initialization, left.valid_frames) != (
+            right.source_id,
+            right.cadence,
+            right.initialization,
+            right.valid_frames,
+        ):
+            raise ValueError(
+                f"Paired records have different source, cadence, initialization or frames: {rid}"
+            )
+
+        def value(row):
+            v = getattr(row, metric)
+            return min(float(v), cap) if row.is_finite and v is not None and np.isfinite(v) else cap
+
+        clusters.setdefault(left.source_id, []).append((value(left), value(right)))
+    groups = [np.array(clusters[k]) for k in sorted(clusters)]
+    n_sources = len(groups)
+
+    def compare(array):
+        a, b = (
+            array.mean(axis=0)
+            if statistic == "mean"
+            else np.quantile(array, 0.5 if statistic == "p50" else 0.95, axis=0)
+        )
+        if mode == "ratio" and b == 0:
+            raise ValueError("Quantile or mean ratio is undefined for a zero baseline")
+        return float(a - b if mode == "difference" else a / b)
+
+    point = compare(np.concatenate(groups))
+    rng = np.random.default_rng(seed)
+    samples = np.empty(int(n_boot), dtype=np.float64)
+    for i in range(len(samples)):
+        draw = rng.integers(n_sources, size=n_sources)
+        samples[i] = compare(np.concatenate([groups[j] for j in draw]))
+    return {
+        "statistic": statistic,
+        "cap": cap,
+        "candidate_only": len(cand_map) - len(shared_ids),
+        "baseline_only": len(base_map) - len(shared_ids),
+        "point_estimate": point,
+        "ci95_low": float(np.quantile(samples, 0.025)),
+        "ci95_high": float(np.quantile(samples, 0.975)),
+        "one_sided_95_upper": float(np.quantile(samples, 0.95)),
+        "num_shared_records": len(shared_ids),
+        "num_source_clusters": n_sources,
+    }
+
+
+@torch.no_grad()
+def measure_secant_amplification(
+    rollout_fn: Callable[[Tensor], Tensor],
+    base_initial_state_si: Tensor,
+    perturbation_scaled: Tensor,
+) -> float:
+    """Measure empirical closed-loop secant amplification ||F(z + delta) - F(z)|| / ||delta|| in D-scale."""
+    scale = torch.tensor(STATE_SCALE_VALUES, device=base_initial_state_si.device, dtype=torch.float64)
+    delta_norm = float(torch.linalg.vector_norm(perturbation_scaled).item())
+    if delta_norm <= 1.0e-15:
+        raise ValueError("perturbation_scaled must be nonzero")
+    out_base = rollout_fn(base_initial_state_si)
+    out_pert = rollout_fn(base_initial_state_si + perturbation_scaled * scale)
+    diff_scaled = (out_pert - out_base) / scale
+    return float(torch.linalg.vector_norm(diff_scaled).item() / delta_norm)
+
+
+__all__ = [
+    "RecordEvalRow",
+    "metrics_json",
+    "cluster_paired_bootstrap_ci",
+    "compute_los_local_errors",
+    "directional_benefit_metrics",
+    "measure_secant_amplification",
+    "summarize_record_rows",
+]
